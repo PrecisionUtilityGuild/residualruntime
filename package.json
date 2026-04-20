@@ -1,0 +1,45 @@
+{
+  "name": "residual-runtime",
+  "version": "0.1.0",
+  "description": "Runtime enforcement layer for AI and programmatic workflows — blocks actions while semantic work is unresolved",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build": "npm run clean && tsc",
+    "start": "npm run build && node dist/index.js",
+    "test": "npm run build && NODE_ENV=test node --test \"dist/**/*.test.js\"",
+    "example:failure-case": "npm run build && node dist/examples/concreteFailureCase.js",
+    "cli": "npm run build && node dist/cli/index.js",
+    "typecheck": "tsc --noEmit",
+    "ci": "npm run typecheck && npm test"
+  },
+  "keywords": [
+    "residual",
+    "runtime",
+    "ai",
+    "agent",
+    "constraint",
+    "blocking"
+  ],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2"
+  },
+  "dependencies": {
+    "ollama": "^0.6.3"
+  }
+}
