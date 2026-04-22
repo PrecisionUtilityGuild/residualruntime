@@ -41,11 +41,41 @@ export type State = {
   gapCounters: Record<string, number>;
 };
 
+export type SessionStatus = "active" | "closed";
+
+export type SessionMetadata = {
+  objectiveType?: string;
+  objectiveRef?: string;
+  title?: string;
+  status: SessionStatus;
+  createdAt: number;
+  closedAt?: number;
+};
+
+export type SessionMetadataInput = {
+  objectiveType?: string;
+  objectiveRef?: string;
+  title?: string;
+  status?: SessionStatus;
+  createdAt?: number;
+  closedAt?: number;
+};
+
+export type EventContext = {
+  branch?: string;
+  commitSha?: string;
+  worktreeId?: string;
+  actorId?: string;
+};
+
 export type Action = {
   kind: "action";
   type: string;
   dependsOn?: string[];
   revocable?: boolean;
+  // Optional resource declarations for cross-session conflict detection.
+  readSet?: string[];
+  writeSet?: string[];
 };
 
 export type Proposal = Action | Assumption | Deferred | Tension | EvidenceGap;

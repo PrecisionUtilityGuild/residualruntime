@@ -12,7 +12,7 @@ The core insight: an action is blocked not because a caller lacks permission, bu
 is a first-class, typed, lifecycled data structure — not a log, not metadata.
 
 Read `docs/ARCHITECTURE.md` and `docs/WALKTHROUGH.md` before proposing any change.
-The Consistency Matrix in `ARCHITECTURE.md §2.6` is the canonical name registry.
+The Consistency Matrix in `ARCHITECTURE.md §10` is the canonical name registry.
 
 ---
 
@@ -27,7 +27,7 @@ Every function exported from `src/index.ts` must have at least one test in `src/
 No exceptions. Research code in `src/research/` is exempt — it must NOT be exported from index.
 
 ### 3. No new data structure without an ARCHITECTURE.md entry first
-Before writing code for any new type, add it to `ARCHITECTURE.md §2.6` (Consistency Matrix)
+Before writing code for any new type, add it to `ARCHITECTURE.md §10` (Consistency Matrix)
 with: name, symbol, and owning subsystem. Name in code must match the matrix exactly.
 
 ### 4. `src/research/` is the sandbox
@@ -64,19 +64,13 @@ workaround for a specific semantic edge case. No docblocks. No "this function do
 
 ---
 
-## Approved next missions (peer-reviewed, ranked)
+## Current priority missions (ranked)
 
-1. **`whatWouldUnblock`** — pure function `(action, residual, state) -> ResidualDelta[]`
-   returning the minimal set of residual changes that would unblock a given action.
-   Lives in `predicates.ts`. Exports from `index.ts`. Full test coverage required.
+1. **MCP parity + docs integrity sweep** — keep `README.md`, `docs/WALKTHROUGH.md`, and `docs/ARCHITECTURE.md` aligned with `src/mcp/*` behavior and contracts.
 
-2. **`createdAt` / `age` on residual items** — add optional `createdAt: number` (unix ms)
-   to `Assumption`, `EvidenceGap`, `Deferred`, and `Tension` types. Expose `age` as a
-   derived property. Unlocks real-world time-based escalation without breaking step-indexed
-   replay. No half-life curves, no continuous-time semantics.
+2. **MCP operational hardening** — preserve deterministic cross-session arbitration (`sessionEvents`, unblock guidance, policy metadata) without changing core residual semantics.
 
-3. **State immutability audit** — verify `State` is effectively immutable through the public
-   API. If any path allows direct mutation, freeze it. Document the invariant in ARCHITECTURE.md.
+3. **Session lifecycle ergonomics** — improve objective metadata continuity and migration UX while keeping replay compatibility.
 
 ## Ideas that are NOT missions yet
 
@@ -115,9 +109,14 @@ src/
   examples/
     concreteFailureCase.ts   — canonical single-tension blocking demo
     multiAgentResidual.ts    — ICU triage multi-agent demo
+  mcp/
+    server.ts                — MCP stdio server + tool contracts
+    sessions.ts              — objective-scoped session manager + SQLite persistence
+    arbitration.ts           — deterministic cross-session conflict arbitration
+    migrate.ts               — legacy NDJSON migration utility
   research/
     reencoding.ts            — experimental CCP₀ trace normalization
-  __tests__/                 — 11 test files, Node built-in test runner
+  __tests__/                 — Node built-in test suites (runtime + MCP coverage)
 ```
 
 ---
@@ -130,4 +129,7 @@ npm run test           # build + run all tests
 npm run typecheck      # type-check only, no emit
 npm run ci             # typecheck + test (run before closing any mission)
 npm run example:failure-case
+npm run mcp            # start MCP stdio server
+npm run mcp:dev        # run MCP server from TypeScript source
+npm run mcp:migrate    # import legacy NDJSON sessions into SQLite
 ```

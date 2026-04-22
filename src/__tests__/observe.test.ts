@@ -44,7 +44,58 @@ test("computeMetrics: correct blockedRate over 3-step failure case", () => {
   assert.equal(m.totalSteps, 3);
   assert.equal(m.totalActionsBlocked, 2);
   assert.equal(m.totalActionsApproved, 1);
+  assert.equal(m.totalSessionConflicts, 0);
+  assert.equal(m.totalSessionArbitrations, 0);
   assert.ok(Math.abs(m.blockedRate - 2 / 3) < 0.001, `expected ~0.667, got ${m.blockedRate}`);
+});
+
+test("computeMetrics: counts cross-session conflict/arbitration replay events", () => {
+  const events = buildFailureCaseEvents();
+  events[1] = {
+    ...events[1],
+    sessionEvents: {
+      conflicts: [
+        {
+          kind: "session_conflict",
+          action: { kind: "action", type: "WRITE_A", writeSet: ["resource:a"] },
+          otherAction: { kind: "action", type: "WRITE_B", writeSet: ["resource:a"] },
+          otherSessionId: "peer-1",
+          conflictType: "write_write",
+          resource: "resource:a",
+          scope: { kind: "branch", value: "feature/shared" },
+          reason: "write/write overlap",
+          unblock: [{ kind: "wait_for_other_session", detail: "wait" }],
+        },
+      ],
+      arbitrations: [
+        {
+          kind: "session_arbitration",
+          action: { kind: "action", type: "WRITE_A", writeSet: ["resource:a"] },
+          otherAction: { kind: "action", type: "WRITE_B", writeSet: ["resource:a"] },
+          sessionId: "s1",
+          otherSessionId: "peer-1",
+          conflictType: "write_write",
+          resource: "resource:a",
+          scope: { kind: "branch", value: "feature/shared" },
+          mode: "serialize_first",
+          outcome: "serialize_wait",
+          preferredSessionId: "peer-1",
+          precedence: {
+            conflictRank: 2,
+            sessionPriority: 100,
+            otherSessionPriority: 200,
+            tieBreak: "objective_priority",
+          },
+          reason: "serialized arbitration",
+          unblock: [{ kind: "wait_for_other_session", detail: "wait" }],
+        },
+      ],
+    },
+  };
+
+  const m = computeMetrics(events);
+  assert.equal(m.totalSessionConflicts, 1);
+  assert.equal(m.totalSessionArbitrations, 1);
 });
 
 test("summarizeTrace: returns non-empty string with key info", () => {

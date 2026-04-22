@@ -4,6 +4,9 @@
   "description": "Runtime enforcement layer for AI and programmatic workflows — blocks actions while semantic work is unresolved",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "bin": {
+    "residual-mcp": "dist/mcp/server.js"
+  },
   "exports": {
     ".": {
       "import": "./dist/index.js",
@@ -21,6 +24,10 @@
     "test": "npm run build && NODE_ENV=test node --test \"dist/**/*.test.js\"",
     "example:failure-case": "npm run build && node dist/examples/concreteFailureCase.js",
     "cli": "npm run build && node dist/cli/index.js",
+    "mcp": "npm run build && node dist/mcp/server.js",
+    "mcp:migrate": "npm run build && node dist/mcp/migrate.js",
+    "mcp:dev": "tsx src/mcp/server.ts",
+    "mcp:migrate:dev": "tsx src/mcp/migrate.ts",
     "typecheck": "tsc --noEmit",
     "ci": "npm run typecheck && npm test"
   },
@@ -40,6 +47,8 @@
     "typescript": "^6.0.2"
   },
   "dependencies": {
-    "ollama": "^0.6.3"
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "ollama": "^0.6.3",
+    "zod": "^4.3.6"
   }
 }

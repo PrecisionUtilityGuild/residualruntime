@@ -18,6 +18,9 @@ export type { TransitionEngine } from "./runtime/transition";
 export { appendStep, readLog, replayLog, createInMemoryLog, ReplayMismatchError, CcpVerificationError } from "./runtime/store";
 export type { StepLogAdapter } from "./runtime/store";
 export { createFileLog } from "./runtime/fileAdapter";
+export { createResidualMcpServer, runStdioServer } from "./mcp/server";
+export { SessionManager } from "./mcp/sessions";
+export type { StepSessionRequest, SessionSnapshot, SessionListItem, LegacyImportResult } from "./mcp/sessions";
 
 // ── CCP₀ verification ────────────────────────────────────────────────────────
 export { translateTrace, verifyCcpTrace } from "./runtime/verify/ccp0";
@@ -39,6 +42,10 @@ export type {
   EvidenceGap,
   Residual,
   State,
+  SessionStatus,
+  SessionMetadata,
+  SessionMetadataInput,
+  EventContext,
   Action,
   Proposal,
   Input,
@@ -57,6 +64,14 @@ export type {
   InvalidAdjudicationEvent,
   SoftBlockedAction,
   ActionCausalAnnotation,
+  SessionConflictType,
+  SessionConflictScope,
+  SessionConflictUnblock,
+  SessionConflictEvent,
+  SessionArbitrationMode,
+  SessionArbitrationOutcome,
+  SessionArbitrationPolicy,
+  SessionArbitrationEvent,
   ReplayEvent,
   StepResult,
   ConflictReport,

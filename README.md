@@ -83,10 +83,46 @@ The engine accumulates **residual** — typed, lifecycled unfinished semantic wo
 - **Temporal residual** — `createdAt` on all residual items; `ageOf(item, nowMs)`; `TensionTimeoutPolicy` with `wallClockMs` for wall-clock timeouts
 - **Safety policies** — deadlock detection, oscillation detection, overflow signaling, escalation (evidence gaps promoted to deferred), auto-adjudication, invalid adjudication reporting
 - **Observability** — `diffStep()`, `computeMetrics()`, `summarizeTrace()`
-- **Replay and persistence** — `appendStep()` / `replayLog()` with full state verification; NDJSON file adapter
+- **Replay and persistence** — `appendStep()` / `replayLog()` with full state verification; NDJSON and in-memory adapters for runtime traces
 - **CCP₀ formal verification** — `translateTrace()` + `verifyCcpTrace()`; wired into `replayLog({ ccpVerify: true })`
 - **Pluggable transition engine** — swap the interpretation layer while the gate stays fixed
 - **CLI demo** — `npm run cli` runs a local Ollama LLM through the gate end-to-end
+- **MCP server** — stdio MCP tools: `new_session`, `list_sessions`, `get_state`, `step`
+- **Objective-scoped sessions** — MCP sessions represent a work objective lifecycle (ticket/PR/incident), with persisted `objectiveType`, `objectiveRef`, `title`, `status`, `createdAt`, `closedAt`
+- **SQLite-backed MCP state** — default MCP session persistence uses `sessions.sqlite` (WAL mode) with indexed append-only session events
+- **Step provenance context** — MCP `step` accepts optional `context` (`branch`, `commitSha`, `worktreeId`, `actorId`) and persists it on replay events for auditability
+- **Cross-session write-set conflict gating** — actions can declare optional `readSet`/`writeSet`; MCP step blocks branch/worktree-scoped write/write and read/write overlaps with deterministic conflict reasons and unblock guidance
+- **Deterministic arbitration policies** — cross-session conflicts emit policy decisions (`serialize_first` or `branch_split_required`) with precedence metadata (conflict class + objective priority + tie-break) and integration-oriented unblock instructions
+
+### MCP session semantics
+
+- A `sessionId` should map to one objective lifecycle, not one branch.
+- Session state is persisted in `sessions.sqlite` under the session root directory.
+- Session root resolution order is: explicit `sessionRootDir` option, `RESIDUAL_SESSION_ROOT_DIR`, `./.residual-sessions`, `$HOME/.codex/residual-runtime/sessions`, then OS temp fallback.
+- Branch/commit/worktree are optional per-step provenance fields (`context`) and can change over a session.
+- When two active sessions share branch/worktree scope, `step` checks approved actions against other sessions' latest approved actions using `readSet`/`writeSet`.
+- Overlapping `writeSet`/`writeSet` and `readSet`/`writeSet` resources are blocked as session conflicts and returned in both `events.sessionConflicts` and `whatWouldUnblock[*].sessionConflicts`.
+- Arbitration decisions are returned in `events.sessionArbitrations` and `whatWouldUnblock[*].sessionArbitrations`, plus effective policy metadata in `events.sessionArbitrationPolicy`.
+- `step` accepts optional `arbitrationPolicy` overrides (`enabled`, `defaultMode`, per-conflict mode overrides, objective priority map).
+- Rollback/cutover flags are available via environment variables: `RESIDUAL_ARBITRATION_ENABLED`, `RESIDUAL_ARBITRATION_MODE`, `RESIDUAL_ARBITRATION_WRITE_WRITE_MODE`, `RESIDUAL_ARBITRATION_READ_WRITE_MODE`.
+- `new_session` accepts optional objective metadata plus optional `seedInput`, `seedProposals`, and `stepOptions`.
+- `get_state` and `list_sessions` return session metadata while preserving backward-compatible `sessionId`/`stepCount` fields; `list_sessions` also returns `sessionRootDir`.
+- MCP tool arguments are strict-validated (unknown keys, blank IDs, malformed proposals/input, and invalid metadata combinations are rejected deterministically).
+- Concurrent stale writers on the same session return a deterministic retry error: `Concurrent session update detected for \"<sessionId>\". Reload state and retry the step.`
+- `npm run mcp:migrate -- --root <dir>` imports legacy `*.ndjson` session logs into SQLite.
+
+---
+
+### MCP implementation status (2026-04-22)
+
+- [x] Stdio server entrypoint is wired (`npm run mcp`, `npm run mcp:dev`, and published bin `residual-mcp`).
+- [x] Tool surface is implemented and discoverable: `new_session`, `list_sessions`, `get_state`, `step`.
+- [x] Session persistence is SQLite-backed (`sessions.sqlite`, WAL mode, indexed event log).
+- [x] Cross-session conflict gating is live for `write_write` and `read_write` overlaps.
+- [x] Deterministic arbitration is live (`serialize_first`, `branch_split_required`) with per-step and env overrides.
+- [x] Migration path from legacy NDJSON sessions is implemented (`npm run mcp:migrate`).
+- [x] Coverage exists in [`src/__tests__/mcp.server.test.ts`](src/__tests__/mcp.server.test.ts) and [`src/__tests__/mcp.sessions.test.ts`](src/__tests__/mcp.sessions.test.ts).
+- Boundary: coordination state is local filesystem SQLite; no external distributed lock service is used.
 
 ---
 
@@ -97,7 +133,9 @@ git clone <repo>
 npm install
 npm run example:failure-case   # canonical traced demo
 npm run cli                    # interactive LLM demo (requires Ollama + llama3.1:8b)
-npm test                       # build + run all 121 tests
+npm run mcp                    # start MCP stdio server
+npm run mcp:migrate -- --root ./.residual-sessions
+npm test                       # build + run all tests
 npm run ci                     # typecheck + test
 ```
 

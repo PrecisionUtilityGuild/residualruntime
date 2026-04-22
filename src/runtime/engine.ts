@@ -17,6 +17,7 @@ import {
   type Proposal,
   type Residual,
   type ResidualLimits,
+  type SessionArbitrationPolicy,
   type State,
   type StepResult,
   type TensionTimeoutPolicy,
@@ -25,6 +26,13 @@ import {
 function deepClone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
+
+const NOOP_SESSION_ARBITRATION_POLICY: SessionArbitrationPolicy = {
+  enabled: false,
+  defaultMode: "serialize_first",
+  modeByConflictType: {},
+  objectiveTypePriority: {},
+};
 
 // Shallow-freeze in test/dev mode so callers discover accidental mutation early.
 // Production skips the freeze to avoid the overhead.
@@ -95,6 +103,9 @@ export function naiveStep(params: {
     autoAdjudications: [],
     invalidAdjudications,
     deadlocks: [],
+    sessionArbitrationPolicy: NOOP_SESSION_ARBITRATION_POLICY,
+    sessionConflicts: [],
+    sessionArbitrations: [],
     emittedRevocable: actionsCandidate.filter((a) => a.revocable === true),
     revokedActions: [],
     replay: {
@@ -206,6 +217,9 @@ export function step(params: {
     autoAdjudications,
     invalidAdjudications,
     deadlocks,
+    sessionArbitrationPolicy: NOOP_SESSION_ARBITRATION_POLICY,
+    sessionConflicts: [],
+    sessionArbitrations: [],
     emittedRevocable,
     revokedActions,
     replay: {

@@ -20,8 +20,8 @@ A typed execution kernel that sits between your interpretation layer (LLMs, plan
 step(state, residual, input, proposals):
   (residualPre, statePre) = discharge(residual, state, input)
   constraints             = merge(input.constraints, lift(residualPre))
-  (stateNext, candidates) = transition(statePre, constraints, proposals)
-  actionsApproved         = filterBlocked(candidates, residualPre, stateNext)
+  (stateNext, candidates, residualNext) = transition(statePre, constraints, proposals, residualPre)
+  actionsApproved         = filterBlocked(candidates, residualNext, stateNext)
   return (stateNext, residualNext, actionsApproved, actionsBlocked, events)
 ```
 
@@ -101,12 +101,12 @@ constraints = merge(input.constraints, lift(residualPre))
 
 ### 3.3 Transition Engine (`src/runtime/transition.ts`)
 
-Computes `(stateNext, candidates)` from `(statePre, constraints, proposals)`. Pluggable — swap the interpretation logic while the gate stays fixed.
+Computes `(stateNext, candidates, residualNext)` from `(statePre, constraints, proposals, residualPre)`. Pluggable — swap the interpretation logic while the gate stays fixed.
 
 ### 3.4 Action Gate (`src/runtime/predicates.ts`)
 
 ```
-actionsApproved = filterBlocked(candidates, residualPre, stateNext)
+actionsApproved = filterBlocked(candidates, residualNext, stateNext)
 ```
 
 Blocks any action whose `dependsOn` atoms intersect:
@@ -174,7 +174,41 @@ Proposed → In residual → Discharged
 - `stateVerify: true` — checks `belief`, `rejected`, `commitments`, `gapCounters`, `beliefSupport` against stored snapshots
 - `ccpVerify: true` — runs CCP₀ verification on the full trace
 
-File adapter (`createFileLog`) survives process restarts. Action identity is checked on replay using `type + sorted(dependsOn)` — preventing false matches on same-type different-dependsOn actions.
+File adapter (`createFileLog`) survives process restarts for log/replay use cases. Action identity is checked on replay using `type + sorted(dependsOn)` — preventing false matches on same-type different-dependsOn actions.
+
+### MCP session contract
+
+The MCP `SessionManager` persists session state in `sessions.sqlite` (WAL mode) and treats each session as an objective lifecycle (for example a ticket, PR, or incident), not a branch identity.
+
+- Session metadata is persisted with:
+  - `objectiveType?`, `objectiveRef?`, `title?`
+  - `status` (`active` | `closed`)
+  - `createdAt`, `closedAt?`
+- Session root directory resolves in this order: explicit `sessionRootDir` arg, `RESIDUAL_SESSION_ROOT_DIR`, `./.residual-sessions`, `$HOME/.codex/residual-runtime/sessions`, OS temp fallback.
+- Append-only `session_events` rows are indexed by `(session_id, step_index)` and `recorded_at`.
+- Each `step` may include optional provenance `context`:
+  - `branch?`, `commitSha?`, `worktreeId?`, `actorId?`
+- `step` context is written onto replay events for auditability without changing the core gating semantics.
+- `new_session` can seed initial state using `seedInput`, `seedProposals`, and optional `stepOptions`.
+- `list_sessions` returns both session summaries and the resolved `sessionRootDir`.
+- MCP tool payloads are strict-validated (no unknown keys; blank IDs and malformed proposal/input payloads are rejected).
+- Actions may declare optional `readSet?: string[]` and `writeSet?: string[]` resource keys.
+- On each MCP `step`, actions that pass residual gating are additionally checked against the latest approved actions in other active sessions sharing `worktreeId` (preferred) or `branch` scope.
+- Overlaps block deterministically:
+  - `writeSet ∩ writeSet` => `write_write`
+  - `writeSet ∩ readSet` or `readSet ∩ writeSet` => `read_write`
+- Cross-session blocks are surfaced as `SessionConflictEvent[]` in `StepResult.sessionConflicts` and in MCP `events.sessionConflicts`, including typed unblock guidance.
+- Arbitration policy module resolves each conflict into a deterministic `SessionArbitrationEvent` with:
+  - mode: `serialize_first` or `branch_split_required`
+  - precedence: conflict class rank + objective priority + deterministic tie-break (`created_at`, then `session_id`)
+  - outcome-specific unblock guidance (`wait_for_other_session`, `split_scope`, `integration_action`, `narrow_resource_sets`)
+- Effective policy metadata is returned on every step via `StepResult.sessionArbitrationPolicy` / MCP `events.sessionArbitrationPolicy`.
+- Operational cutover controls:
+  - env defaults: `RESIDUAL_ARBITRATION_ENABLED`, `RESIDUAL_ARBITRATION_MODE`, `RESIDUAL_ARBITRATION_WRITE_WRITE_MODE`, `RESIDUAL_ARBITRATION_READ_WRITE_MODE`
+  - per-step override: `step(..., arbitrationPolicy)`
+- Replay traces persist `replay.sessionEvents.{conflicts,arbitrations}` for audit and observability summaries.
+- Concurrent stale writers on the same session step index fail with a deterministic retry signal (`Concurrent session update detected ...`).
+- Legacy `*.ndjson` sessions can be imported via `npm run mcp:migrate -- --root <session-dir>`.
 
 ---
 
@@ -216,9 +250,14 @@ src/
   cli/
     index.ts                 — interactive Ollama demo loop
     scenario.ts              — deployment scenario seed and system prompt
+  mcp/
+    server.ts                — MCP stdio server + tool contracts
+    sessions.ts              — objective-scoped session manager + SQLite store
+    arbitration.ts           — deterministic cross-session arbitration policies
+    migrate.ts               — legacy NDJSON -> SQLite migration CLI
   research/
     reencoding.ts            — experimental CCP₀ trace normalization (not exported)
-  __tests__/                 — 121 tests, Node built-in test runner
+  __tests__/                 — Node built-in test suite, including MCP server/session coverage
 ```
 
 ---
@@ -260,6 +299,17 @@ Every term that appears in code or docs must be registered here before use. Name
 | `wall-clock timeout` | `TensionTimeoutPolicy.wallClockMs?: number` | engine.ts |
 | `state immutability` | `freezeIfTest(obj)` | engine.ts (shallow-frozen in test/development) |
 | `evidence gap deadlock` | `DeadlockEvent { itemKind: "evidence_gap" }` | policies.ts |
+| `session metadata` | `SessionMetadata` | mcp/sessions.ts + domain.ts |
+| `step provenance context` | `EventContext` | mcp/server.ts + events.ts |
+| `action read set` | `Action.readSet?: string[]` | domain.ts + mcp/sessions.ts |
+| `action write set` | `Action.writeSet?: string[]` | domain.ts + mcp/sessions.ts |
+| `cross-session conflict event` | `SessionConflictEvent` | events.ts + mcp/sessions.ts |
+| `session arbitration policy` | `SessionArbitrationPolicy` | events.ts + mcp/arbitration.ts |
+| `session arbitration event` | `SessionArbitrationEvent` | events.ts + mcp/arbitration.ts + mcp/sessions.ts |
+| `arbitration mode` | `SessionArbitrationMode` | events.ts + mcp/arbitration.ts |
+| `arbitration outcome` | `SessionArbitrationOutcome` | events.ts + mcp/arbitration.ts |
+| `conflict scope` | `SessionConflictScope` | events.ts + mcp/sessions.ts |
+| `conflict type` | `SessionConflictType` | events.ts + mcp/sessions.ts |
 
 **Naming rule:** if a new term is introduced in code or docs, add it here with symbol and owner before merge.
 

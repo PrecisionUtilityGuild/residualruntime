@@ -9,3 +9,5 @@ CLAUDE.md
 .env.example
 .env.test
 *.ndjson
+*.cjs
+.residual-sessions/

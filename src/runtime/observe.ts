@@ -16,6 +16,8 @@ export type StepMetrics = {
   totalSteps: number;
   totalActionsApproved: number;
   totalActionsBlocked: number;
+  totalSessionConflicts: number;
+  totalSessionArbitrations: number;
   blockedRate: number;
   avgResidualSize: number;
   peakResidualSize: number;
@@ -63,17 +65,30 @@ function residualSize(event: ReplayEvent): number {
 
 export function computeMetrics(events: ReplayEvent[]): StepMetrics {
   if (events.length === 0) {
-    return { totalSteps: 0, totalActionsApproved: 0, totalActionsBlocked: 0, blockedRate: 0, avgResidualSize: 0, peakResidualSize: 0 };
+    return {
+      totalSteps: 0,
+      totalActionsApproved: 0,
+      totalActionsBlocked: 0,
+      totalSessionConflicts: 0,
+      totalSessionArbitrations: 0,
+      blockedRate: 0,
+      avgResidualSize: 0,
+      peakResidualSize: 0,
+    };
   }
 
   let totalActionsApproved = 0;
   let totalActionsBlocked = 0;
+  let totalSessionConflicts = 0;
+  let totalSessionArbitrations = 0;
   let totalResidualSize = 0;
   let peakResidualSize = 0;
 
   for (const event of events) {
     totalActionsApproved += event.approvedActions.length;
     totalActionsBlocked += event.blockedActions.length;
+    totalSessionConflicts += event.sessionEvents?.conflicts.length ?? 0;
+    totalSessionArbitrations += event.sessionEvents?.arbitrations.length ?? 0;
     const size = residualSize(event);
     totalResidualSize += size;
     if (size > peakResidualSize) peakResidualSize = size;
@@ -86,6 +101,8 @@ export function computeMetrics(events: ReplayEvent[]): StepMetrics {
     totalSteps: events.length,
     totalActionsApproved,
     totalActionsBlocked,
+    totalSessionConflicts,
+    totalSessionArbitrations,
     blockedRate,
     avgResidualSize: totalResidualSize / events.length,
     peakResidualSize,
@@ -102,6 +119,12 @@ export function summarizeTrace(events: ReplayEvent[]): string {
   const allBlocked = events.flatMap((e) => e.blockedActions.map((a) => a.type));
   if (allBlocked.length > 0) {
     lines.push(`Blocked actions: ${[...new Set(allBlocked)].join(", ")}`);
+  }
+
+  if (m.totalSessionConflicts > 0 || m.totalSessionArbitrations > 0) {
+    lines.push(
+      `Cross-session events: conflicts=${m.totalSessionConflicts}, arbitrations=${m.totalSessionArbitrations}`
+    );
   }
 
   const rejectedAtoms = events.flatMap((e) => e.after.state.rejected);

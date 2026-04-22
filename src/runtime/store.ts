@@ -44,7 +44,12 @@ export class CcpVerificationError extends Error {
 }
 
 function actionKey(a: Action): string {
-  return JSON.stringify({ type: a.type, dependsOn: (a.dependsOn ?? []).slice().sort() });
+  return JSON.stringify({
+    type: a.type,
+    dependsOn: (a.dependsOn ?? []).slice().sort(),
+    readSet: (a.readSet ?? []).slice().sort(),
+    writeSet: (a.writeSet ?? []).slice().sort(),
+  });
 }
 
 function serializeActions(actions: Action[]): string[] {

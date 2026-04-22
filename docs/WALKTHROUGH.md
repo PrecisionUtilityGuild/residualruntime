@@ -234,7 +234,46 @@ If this document makes sense, the next hop depends on what you want.
 - For concrete mechanics, continue into [`src/runtime/engine.ts`](../src/runtime/engine.ts) and [`src/runtime/transition.ts`](../src/runtime/transition.ts).
 - For the canonical executable trace, run `npm run example:failure-case` or read [`src/examples/concreteFailureCase.ts`](../src/examples/concreteFailureCase.ts).
 
-## 10. On Redundancy
+## 10. Cross-Session Arbitration Cutover Guardrails
+
+Cross-session write-set gating now has a deterministic arbitration layer. Operationally, this introduces a controlled path from "detected overlap" to "operator action" rather than a generic block-only result.
+
+Default behavior:
+
+- conflicts are detected on shared branch/worktree scope
+- arbitration defaults to `serialize_first`
+- each blocked action includes explicit policy decisions and unblock instructions
+
+Rollout controls:
+
+- global enable/disable: `RESIDUAL_ARBITRATION_ENABLED`
+- default mode: `RESIDUAL_ARBITRATION_MODE`
+- per-conflict-class mode overrides:
+  - `RESIDUAL_ARBITRATION_WRITE_WRITE_MODE`
+  - `RESIDUAL_ARBITRATION_READ_WRITE_MODE`
+- per-step overrides through MCP `step(..., arbitrationPolicy)`
+
+Fallback posture:
+
+- set `RESIDUAL_ARBITRATION_ENABLED=false` to bypass cross-session arbitration gating during incident rollback
+- keep replay enabled so conflict/arbitration event history remains auditable
+
+## 11. MCP Layer Readiness Checks
+
+If you want to verify whether MCP implementation is "done enough" for this milestone, run this checklist:
+
+1. `npm run mcp` starts without schema/tool registration errors.
+2. MCP client `listTools` returns exactly: `new_session`, `list_sessions`, `get_state`, `step`.
+3. `new_session` + `step` + `get_state` flows persist and survive process restart.
+4. `step` returns deterministic cross-session conflict/arbitration payloads when `readSet`/`writeSet` overlap in shared scope.
+5. malformed MCP payloads are rejected deterministically (strict schemas for `step` and `new_session`).
+6. stale concurrent writers produce a deterministic retry signal (`Concurrent session update detected ...`).
+7. `npm run mcp:migrate -- --root <dir>` imports legacy `*.ndjson` logs into `sessions.sqlite`.
+8. `npm test` passes, including `src/__tests__/mcp.server.test.ts` and `src/__tests__/mcp.sessions.test.ts`.
+
+Current boundary for this cut: session coordination is local SQLite-backed state, not a distributed lock service.
+
+## 12. On Redundancy
 
 The repository intentionally keeps a small active documentation surface:
 
