@@ -48,6 +48,8 @@ step({ proposals: [{ kind: "action", type: "DEPLOY_TO_PRODUCTION", dependsOn: ["
 
 The engine accumulates **residual** — typed, lifecycled unfinished semantic work. An action is blocked whenever any atom in its `dependsOn` is under open tension, below evidence threshold, or behind an unresolved deferred dependency. When residual clears, the action is approved.
 
+Adjudication is final by default: once a loser atom is rejected, unresolved tension on the same pair cannot silently re-enter the residual. To explicitly reopen a previously resolved pair, callers must provide `input.reopenSignals` with `{ phi1, phi2, source, reason }` provenance.
+
 ---
 
 ## Residual types
@@ -74,11 +76,63 @@ The engine accumulates **residual** — typed, lifecycled unfinished semantic wo
 
 ---
 
+## Domain-Fit Scenario Matrix
+
+The strongest maintained workflow proofs are encoded in [`src/__tests__/domain-fit.test.ts`](src/__tests__/domain-fit.test.ts):
+
+| Workflow family | World-state hazard | Expected runtime behavior |
+|---|---|---|
+| Finance settlement | Counterparty solvency dispute | Block settlement while tension is open; approve once adjudicated |
+| Medical administration | Lab evidence threshold + deferred attending signoff | Block on both hazards; narrow blockers after evidence arrives; approve after deferred signoff materializes |
+| Security/ops deployment | Post-approval risk dispute on a revocable deploy | Revoke previously approved revocable action when new unresolved blocker appears |
+| Manufacturing safety control | Previously adjudicated losing branch | Permanently foreclose actions that depend on rejected safety branch |
+
+These scenarios are intended to stay durable and executable rather than narrative-only examples.
+
+---
+
+## Fit Boundaries
+
+Strong fit:
+- Runtime execution gates where action validity depends on live, changing world-state from multiple observers.
+- Systems that need explicit blocker explanations (`whatWouldUnblock`) and deterministic revocation semantics.
+- Agent collaboration surfaces where unresolved disputes, evidence thresholds, and deferred commitments are first-class.
+
+Weak fit:
+- Pure sequencing problems where a workflow engine already guarantees sufficient correctness.
+- Static policy-only enforcement where preconditions are fully known and rarely change at runtime.
+- Domains that cannot or will not feed timely evidence/constraint updates into `step()`.
+
+---
+
+## Response Cost Expectations
+
+- `step` is optimized for operational cadence: approved actions, canonical blocker certificates, residual counts, and event deltas.
+- `get_state` is the inspection path: full state, full residual arrays, and verbose summaries for debugging/recovery.
+- Response footprint scales with active conflict surfaces.
+  More blocked actions increase `blocked[]`; more arbitration/conflict activity increases `events.*`; larger residual sets increase `get_state` payload size more than `step`.
+- In tight loops, prefer frequent `step` calls and reserve `get_state` for checkpoints, troubleshooting, or handoff snapshots.
+
+---
+
+## Certificate Semantics
+
+Blocked actions now return `blocked[]` entries with `certificates[]`. Each certificate has two distinct layers:
+
+- **Hard semantics**: `next`, `sufficient`, and `permanent` describe strict unblock logic.
+- **Advisory semantics**: `recommendations` carries acquisition moves (`observe`, `query`, `request_approval`, `run_check`) that suggest useful next work but do not claim logical sufficiency on their own.
+
+This split lets callers separate "what is provably enough to unblock" from "what is operationally useful to try next."
+
+---
+
 ## What's built
 
 - **Core runtime** — `step()`, `naiveStep()`, `discharge()`, `lift()`, `filterBlocked()`, `blocks()`, `blockingAtoms()`
 - **Counterfactual unblocking** — `whatWouldUnblock(action, residual, state) → UnblockAnalysis`
+- **Knowledge-acquisition guidance** — blocker certificates include typed advisory acquisition moves for evidence, observation, query, and approval chasing workflows
 - **AGM belief revision** — `contractBelief()` cascades minimal belief retraction on adjudication
+- **Explicit reopen semantics** — resolved tensions reopen only through provenance-carrying `input.reopenSignals`; silent reopen attempts are surfaced as deterministic `reopenBlocked` events
 - **Revocable actions** — approved revocable actions tracked; retracted if a later step would block them
 - **Temporal residual** — `createdAt` on all residual items; `ageOf(item, nowMs)`; `TensionTimeoutPolicy` with `wallClockMs` for wall-clock timeouts
 - **Safety policies** — deadlock detection, oscillation detection, overflow signaling, escalation (evidence gaps promoted to deferred), auto-adjudication, invalid adjudication reporting
@@ -87,7 +141,7 @@ The engine accumulates **residual** — typed, lifecycled unfinished semantic wo
 - **CCP₀ formal verification** — `translateTrace()` + `verifyCcpTrace()`; wired into `replayLog({ ccpVerify: true })`
 - **Pluggable transition engine** — swap the interpretation layer while the gate stays fixed
 - **CLI demo** — `npm run cli` runs a local Ollama LLM through the gate end-to-end
-- **MCP server** — stdio MCP tools: `new_session`, `list_sessions`, `get_state`, `step`
+- **MCP server** — stdio MCP tools: `new_session`, `list_sessions`, `get_state`, `step`, `update_session`
 - **Objective-scoped sessions** — MCP sessions represent a work objective lifecycle (ticket/PR/incident), with persisted `objectiveType`, `objectiveRef`, `title`, `status`, `createdAt`, `closedAt`
 - **SQLite-backed MCP state** — default MCP session persistence uses `sessions.sqlite` (WAL mode) with indexed append-only session events
 - **Step provenance context** — MCP `step` accepts optional `context` (`branch`, `commitSha`, `worktreeId`, `actorId`) and persists it on replay events for auditability
@@ -99,14 +153,18 @@ The engine accumulates **residual** — typed, lifecycled unfinished semantic wo
 - A `sessionId` should map to one objective lifecycle, not one branch.
 - Session state is persisted in `sessions.sqlite` under the session root directory.
 - Session root resolution order is: explicit `sessionRootDir` option, `RESIDUAL_SESSION_ROOT_DIR`, `./.residual-sessions`, `$HOME/.codex/residual-runtime/sessions`, then OS temp fallback.
-- Branch/commit/worktree are optional per-step provenance fields (`context`) and can change over a session.
-- When two active sessions share branch/worktree scope, `step` checks approved actions against other sessions' latest approved actions using `readSet`/`writeSet`.
-- Overlapping `writeSet`/`writeSet` and `readSet`/`writeSet` resources are blocked as session conflicts and returned in both `events.sessionConflicts` and `whatWouldUnblock[*].sessionConflicts`.
-- Arbitration decisions are returned in `events.sessionArbitrations` and `whatWouldUnblock[*].sessionArbitrations`, plus effective policy metadata in `events.sessionArbitrationPolicy`.
+- Branch/commit/worktree provenance (`context`) can change over a session, but any `step` that proposes `readSet`/`writeSet` claims must provide fresh context.
+- When two active sessions share branch/worktree scope, `step` checks proposed actions against other sessions' held resource claims using `readSet`/`writeSet`.
+- Overlapping `writeSet`/`writeSet` and `readSet`/`writeSet` resources are blocked as session conflicts and returned once in `events.sessionConflicts`.
+- Arbitration decisions are returned once in `events.sessionArbitrations`, plus effective policy metadata in `events.sessionArbitrationPolicy`.
+- `step` returns blocked-action guidance in `blocked[]` (`action` + typed `certificates[]`) and keeps `residualSummary` lean (counts + `hasOpenBlockers`).
+- `certificates[].next` + `sufficient/permanent` are strict unblock semantics; `certificates[].recommendations` are advisory acquisition moves.
+- `step` accepts optional `input.reopenSignals` (`phi1`, `phi2`, `source`, `reason`) to explicitly reopen previously resolved tensions; silent reopen attempts are rejected and surfaced in `events.reopenBlocked`.
 - `step` accepts optional `arbitrationPolicy` overrides (`enabled`, `defaultMode`, per-conflict mode overrides, objective priority map).
 - Rollback/cutover flags are available via environment variables: `RESIDUAL_ARBITRATION_ENABLED`, `RESIDUAL_ARBITRATION_MODE`, `RESIDUAL_ARBITRATION_WRITE_WRITE_MODE`, `RESIDUAL_ARBITRATION_READ_WRITE_MODE`.
 - `new_session` accepts optional objective metadata plus optional `seedInput`, `seedProposals`, and `stepOptions`.
-- `get_state` and `list_sessions` return session metadata while preserving backward-compatible `sessionId`/`stepCount` fields; `list_sessions` also returns `sessionRootDir`.
+- `update_session` can explicitly release held resource claims and/or mark a session `closed` when work is integrated.
+- `get_state` remains the verbose inspection endpoint (`state`, full `residual`, verbose `residualSummary`) while preserving backward-compatible `sessionId`/`stepCount` fields; `list_sessions` also returns `sessionRootDir`.
 - MCP tool arguments are strict-validated (unknown keys, blank IDs, malformed proposals/input, and invalid metadata combinations are rejected deterministically).
 - Concurrent stale writers on the same session return a deterministic retry error: `Concurrent session update detected for \"<sessionId>\". Reload state and retry the step.`
 - `npm run mcp:migrate -- --root <dir>` imports legacy `*.ndjson` session logs into SQLite.
@@ -138,6 +196,27 @@ npm run mcp:migrate -- --root ./.residual-sessions
 npm test                       # build + run all tests
 npm run ci                     # typecheck + test
 ```
+
+## Local MCP install
+
+Residual Runtime is designed to ship as a **local stdio MCP server** via npm, not as a hosted service.
+
+Requirements:
+
+- Node.js `>=22.13.0`
+  This is the current tested runtime floor for the packaged local MCP.
+- A local filesystem location for MCP session state (`.residual-sessions` by default)
+
+Install and run:
+
+```sh
+npm install -g residual-runtime
+residual-mcp
+```
+
+Point your MCP client at the `residual-mcp` binary. The server speaks stdio and persists session state locally; it does not require any remote service.
+
+For swarm-style coordination, use `step` to claim scoped resources and `update_session` to release claims or close the session when the work is integrated.
 
 ---
 

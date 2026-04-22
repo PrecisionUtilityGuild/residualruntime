@@ -53,6 +53,8 @@ export type {
   ResidualLimits,
   ResidualDelta,
   UnblockAnalysis,
+  AcquisitionMove,
+  BlockerCertificate,
 } from "./runtime/model";
 
 // ── Event / result types ─────────────────────────────────────────────────────

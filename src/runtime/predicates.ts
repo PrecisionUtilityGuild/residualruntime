@@ -1,4 +1,13 @@
-import type { Action, Residual, ResidualDelta, State, UnblockAnalysis } from "./model";
+import type {
+  Action,
+  AcquisitionMove,
+  BlockerCertificate,
+  Residual,
+  ResidualDelta,
+  State,
+  UnblockAnalysis,
+} from "./model";
+import { constraintIsEffectivelyMaterialized } from "./deferredState";
 
 export function blocks(residual: Residual, state: State, action: Action): boolean {
   const deps = action.dependsOn ?? [];
@@ -8,6 +17,7 @@ export function blocks(residual: Residual, state: State, action: Action): boolea
   if (state.rejected.some((r) => deps.includes(r))) return true;
 
   return residual.deferred.some((d) => {
+    if (constraintIsEffectivelyMaterialized(d.constraint, residual, state)) return false;
     const c = d.constraint;
     let atoms: string[] = [];
     if (c.type === "RequireEvidence") atoms = [c.phi];
@@ -32,6 +42,7 @@ export function blockingAtoms(residual: Residual, state: State, action: Action):
     if (deps.includes(r)) atoms.push(r);
   }
   for (const d of residual.deferred) {
+    if (constraintIsEffectivelyMaterialized(d.constraint, residual, state)) continue;
     const c = d.constraint;
     let dAtoms: string[] = [];
     if (c.type === "RequireEvidence") dAtoms = [c.phi];
@@ -74,6 +85,102 @@ function applyDelta(delta: DeltaCandidate, residual: Residual, state: State): { 
   return { residual: r, state: s };
 }
 
+function unresolvedKey(phi1: string, phi2: string): string {
+  return [phi1, phi2].sort().join("\0");
+}
+
+function dedupeMoves(moves: AcquisitionMove[]): AcquisitionMove[] {
+  const seen = new Set<string>();
+  const deduped: AcquisitionMove[] = [];
+  for (const move of moves) {
+    const key = `${move.kind}|${move.target}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(move);
+  }
+  return deduped;
+}
+
+function rejectedRecommendations(rejectedAtoms: string[]): AcquisitionMove[] {
+  const scope = rejectedAtoms.slice().sort().join("|");
+  return [
+    {
+      kind: "query",
+      target: `plan:alternatives:${scope}`,
+      reason: "Select an alternate plan that avoids permanently rejected atoms.",
+    },
+  ];
+}
+
+function tensionRecommendations(phi1: string, phi2: string): AcquisitionMove[] {
+  const pair = [phi1, phi2].sort().join("|");
+  return [
+    {
+      kind: "query",
+      target: `source-of-truth:${pair}`,
+      reason: "Gather authoritative evidence to adjudicate the open tension.",
+    },
+    {
+      kind: "observe",
+      target: `adjudication:${pair}`,
+      reason: "Watch for adjudication updates when another actor owns the decision.",
+    },
+  ];
+}
+
+function evidenceGapRecommendations(phi: string): AcquisitionMove[] {
+  return [
+    {
+      kind: "run_check",
+      target: `evidence:${phi}`,
+      reason: "Run the relevant check to raise belief on the required atom.",
+    },
+    {
+      kind: "query",
+      target: `evidence:${phi}`,
+      reason: "Query existing systems for already-produced evidence before re-running checks.",
+    },
+  ];
+}
+
+function deferredRecommendations(atom: string, constraintKinds: Set<string>): AcquisitionMove[] {
+  const moves: AcquisitionMove[] = [];
+  if (constraintKinds.has("Prop")) {
+    moves.push({
+      kind: "request_approval",
+      target: `approval:${atom}`,
+      reason: "Request the missing approval/commitment required for this dependency.",
+    });
+  }
+  if (constraintKinds.has("RequireEvidence")) {
+    moves.push({
+      kind: "run_check",
+      target: `evidence:${atom}`,
+      reason: "Produce the evidence needed to satisfy the deferred dependency.",
+    });
+  }
+  if (constraintKinds.has("Unresolved")) {
+    moves.push({
+      kind: "query",
+      target: `dependency:${atom}`,
+      reason: "Query which unresolved branch should be committed to discharge this dependency.",
+    });
+  }
+  if (moves.length === 0) {
+    moves.push({
+      kind: "query",
+      target: `dependency:${atom}`,
+      reason: "Query dependency state to identify the next unblockable commit.",
+    });
+  }
+  moves.push({
+    kind: "observe",
+    target: `dependency:${atom}`,
+    reason: "Observe for upstream dependency resolution if another actor controls it.",
+  });
+  return dedupeMoves(moves);
+}
+
 export function whatWouldUnblock(
   action: Action,
   residual: Residual,
@@ -105,6 +212,7 @@ export function whatWouldUnblock(
   }
 
   for (const d of residual.deferred) {
+    if (constraintIsEffectivelyMaterialized(d.constraint, residual, state)) continue;
     const c = d.constraint;
     let dAtoms: string[] = [];
     if (c.type === "Prop") dAtoms = [c.phi];
@@ -123,6 +231,152 @@ export function whatWouldUnblock(
   });
 
   return { permanent: false, deltas };
+}
+
+export function blockerCertificates(
+  action: Action,
+  residual: Residual,
+  state: State
+): BlockerCertificate[] {
+  const deps = action.dependsOn ?? [];
+  const rejectedAtoms = [...new Set(deps.filter((dep) => state.rejected.includes(dep)))].sort();
+  if (rejectedAtoms.length > 0) {
+    return [
+      {
+        blockerId: `rejected:${rejectedAtoms.join("|")}`,
+        blockerType: "epistemic_rejected",
+        atoms: rejectedAtoms,
+        permanent: true,
+        sufficient: true,
+        recommendations: {
+          semantics: "advisory",
+          moves: rejectedRecommendations(rejectedAtoms),
+        },
+        next: {
+          kind: "replan_without_rejected_atom",
+          rejectedAtoms,
+        },
+      },
+    ];
+  }
+
+  const certificates: BlockerCertificate[] = [];
+
+  const seenTensions = new Set<string>();
+  for (const tension of residual.tensions) {
+    if (!deps.includes(tension.phi1) && !deps.includes(tension.phi2)) continue;
+
+    const pairKey = unresolvedKey(tension.phi1, tension.phi2);
+    if (seenTensions.has(pairKey)) continue;
+    seenTensions.add(pairKey);
+
+    const options = [tension.phi1, tension.phi2].map((winner) => {
+      const delta: DeltaCandidate = {
+        kind: "adjudicate-tension",
+        phi1: tension.phi1,
+        phi2: tension.phi2,
+        winner,
+      };
+      const after = applyDelta(delta, residual, state);
+      return {
+        winner,
+        sufficient: !blocks(after.residual, after.state, action),
+      };
+    });
+
+    certificates.push({
+      blockerId: `tension:${[tension.phi1, tension.phi2].sort().join("|")}`,
+      blockerType: "epistemic_tension",
+      atoms: [tension.phi1, tension.phi2].filter((atom) => deps.includes(atom)),
+      permanent: false,
+      sufficient: options.some((option) => option.sufficient),
+      recommendations: {
+        semantics: "advisory",
+        moves: tensionRecommendations(tension.phi1, tension.phi2),
+      },
+      next: {
+        kind: "adjudicate_tension",
+        phi1: tension.phi1,
+        phi2: tension.phi2,
+        options,
+      },
+    });
+  }
+
+  const maxThresholdByPhi = new Map<string, number>();
+  for (const gap of residual.evidenceGaps) {
+    if (!deps.includes(gap.phi)) continue;
+    const prev = maxThresholdByPhi.get(gap.phi) ?? Number.NEGATIVE_INFINITY;
+    maxThresholdByPhi.set(gap.phi, Math.max(prev, gap.threshold));
+  }
+
+  for (const [phi, threshold] of [...maxThresholdByPhi.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+    const delta: DeltaCandidate = {
+      kind: "satisfy-evidence-gap",
+      phi,
+      requiredBelief: threshold,
+    };
+    const after = applyDelta(delta, residual, state);
+    certificates.push({
+      blockerId: `evidence_gap:${phi}`,
+      blockerType: "epistemic_evidence_gap",
+      atoms: [phi],
+      permanent: false,
+      sufficient: !blocks(after.residual, after.state, action),
+      recommendations: {
+        semantics: "advisory",
+        moves: evidenceGapRecommendations(phi),
+      },
+      next: {
+        kind: "provide_evidence",
+        phi,
+        minBelief: threshold,
+      },
+    });
+  }
+
+  const deferredKindsByAtom = new Map<string, Set<string>>();
+  for (const deferred of residual.deferred) {
+    if (constraintIsEffectivelyMaterialized(deferred.constraint, residual, state)) continue;
+    const constraint = deferred.constraint;
+    const atoms =
+      constraint.type === "Unresolved"
+        ? [constraint.phi1, constraint.phi2]
+        : "phi" in constraint
+          ? [constraint.phi]
+          : [];
+    for (const atom of atoms) {
+      if (!deps.includes(atom)) continue;
+      const kinds = deferredKindsByAtom.get(atom) ?? new Set<string>();
+      kinds.add(constraint.type);
+      deferredKindsByAtom.set(atom, kinds);
+    }
+  }
+
+  for (const atom of [...deferredKindsByAtom.keys()].sort()) {
+    const delta: DeltaCandidate = {
+      kind: "commit-deferred-dependency",
+      phi: atom,
+    };
+    const after = applyDelta(delta, residual, state);
+    certificates.push({
+      blockerId: `deferred:${atom}`,
+      blockerType: "epistemic_deferred",
+      atoms: [atom],
+      permanent: false,
+      sufficient: !blocks(after.residual, after.state, action),
+      recommendations: {
+        semantics: "advisory",
+        moves: deferredRecommendations(atom, deferredKindsByAtom.get(atom) ?? new Set<string>()),
+      },
+      next: {
+        kind: "satisfy_dependency",
+        phi: atom,
+      },
+    });
+  }
+
+  return certificates.sort((left, right) => left.blockerId.localeCompare(right.blockerId));
 }
 
 export function filterBlocked(

@@ -64,6 +64,64 @@ test("deferred Prop dependency stays pending while the dependency is under open 
   assert.ok(s3.stateNext.commitments.some((c) => c.type === "Prop" && c.phi === "launch=allowed"));
 });
 
+test("deferred Prop is pruned when the target proposition is directly committed", () => {
+  const deferred = {
+    kind: "deferred" as const,
+    constraint: { type: "Prop" as const, phi: "specialist_approved" },
+    dependencies: ["specialist_note_signed"],
+  };
+
+  let state = createInitialState();
+  let residual = createEmptyResidual();
+
+  const s1 = step({ state, residual, input: {}, proposals: [deferred] });
+  assert.equal(s1.residualNext.deferred.length, 1, "step 1: deferred enters residual");
+  state = s1.stateNext;
+  residual = s1.residualNext;
+
+  const s2 = step({
+    state,
+    residual,
+    input: { constraints: [{ type: "Prop", phi: "specialist_approved" }] },
+    proposals: [{ kind: "action", type: "START_TREATMENT", dependsOn: ["specialist_approved"] }],
+  });
+
+  assert.equal(
+    s2.residualNext.deferred.length,
+    0,
+    "step 2: deferred is removed once the target proposition is directly committed"
+  );
+  assert.ok(
+    s2.stateNext.commitments.some(
+      (c) => c.type === "Prop" && c.phi === "specialist_approved"
+    ),
+    "step 2: target proposition is committed"
+  );
+  assert.equal(s2.actionsApproved.length, 1, "step 2: action is no longer ghost-blocked");
+});
+
+test("stale deferred Prop does not keep blocking after the target is already committed", () => {
+  const state = createInitialState();
+  state.commitments.push({ type: "Prop", phi: "specialist_approved" });
+  const residual = createEmptyResidual();
+  residual.deferred.push({
+    kind: "deferred",
+    constraint: { type: "Prop", phi: "specialist_approved" },
+    dependencies: ["specialist_note_signed"],
+  });
+
+  const result = step({
+    state,
+    residual,
+    input: {},
+    proposals: [{ kind: "action", type: "START_TREATMENT", dependsOn: ["specialist_approved"] }],
+  });
+
+  assert.equal(result.residualNext.deferred.length, 0, "stale deferred is pruned");
+  assert.equal(result.actionsApproved.length, 1, "action is approved once target is already committed");
+  assert.equal(result.actionsBlocked.length, 0);
+});
+
 test("assumption decay: retracted after enough steps without contradicting evidence", () => {
   const assumption = { kind: "assumption" as const, phi: "fast_path", weight: 1.0, decayPerStep: 0.4 };
   let state = createInitialState();
@@ -150,6 +208,119 @@ test("AGM contraction: winning atom action is not blocked by stale loser belief"
     s2.stateNext.belief["x=false"] === undefined || s2.stateNext.belief["x=false"] === 0,
     "loser belief contracted"
   );
+});
+
+test("reopen policy: silent reopen attempt is blocked and leaves adjudication final", () => {
+  const tension = { type: "Unresolved" as const, phi1: "x=true", phi2: "x=false" };
+  const winnerAction = {
+    kind: "action" as const,
+    type: "USE_X_TRUE",
+    dependsOn: ["x=true"],
+    revocable: true,
+  };
+
+  const s1 = step({
+    state: createInitialState(),
+    residual: createEmptyResidual(),
+    input: { constraints: [tension] },
+    proposals: [],
+  });
+  const s2 = step({
+    state: s1.stateNext,
+    residual: s1.residualNext,
+    input: {
+      adjudications: [{ phi1: "x=true", phi2: "x=false", winner: "x=true" }],
+    },
+    proposals: [winnerAction],
+  });
+  assert.equal(s2.actionsApproved.length, 1, "setup: winner action is approved before reopen attempt");
+  assert.equal(s2.emittedRevocable.length, 1, "setup: revocable action is tracked for future revocation checks");
+
+  const s3 = step({
+    state: s2.stateNext,
+    residual: s2.residualNext,
+    input: { constraints: [tension] },
+    proposals: [{ kind: "action", type: "USE_X_FALSE", dependsOn: ["x=false"] }],
+    priorRevocable: s2.emittedRevocable,
+  });
+
+  assert.equal(s3.reopenApplied.length, 0, "silent reopen must not be applied");
+  assert.equal(s3.reopenBlocked.length, 1, "silent reopen is surfaced deterministically");
+  assert.equal(s3.reopenBlocked[0].attemptedVia, "constraint");
+  assert.equal(s3.reopenBlocked[0].requiredSignal, "input.reopenSignals");
+  assert.equal(s3.residualNext.tensions.length, 0, "silent reopen attempt must not rematerialize tension");
+  assert.ok(s3.stateNext.rejected.includes("x=false"), "loser remains rejected after silent reopen attempt");
+  assert.ok(
+    s3.stateNext.commitments.some(
+      (constraint) => constraint.type === "Prop" && constraint.phi === "x=true"
+    ),
+    "winner commitment remains intact when reopen is not explicitly authorized"
+  );
+  assert.equal(s3.actionsApproved.length, 0);
+  assert.equal(s3.actionsBlocked.length, 1, "action on loser remains permanently blocked");
+  assert.equal(
+    s3.revokedActions.length,
+    0,
+    "no revocation should occur when reopen was forbidden and no new tension is introduced"
+  );
+});
+
+test("reopen policy: explicit reopen signal reopens tension and can revoke prior revocable action", () => {
+  const tension = { type: "Unresolved" as const, phi1: "x=true", phi2: "x=false" };
+  const winnerAction = {
+    kind: "action" as const,
+    type: "USE_X_TRUE",
+    dependsOn: ["x=true"],
+    revocable: true,
+  };
+
+  const s1 = step({
+    state: createInitialState(),
+    residual: createEmptyResidual(),
+    input: { constraints: [tension] },
+    proposals: [],
+  });
+  const s2 = step({
+    state: s1.stateNext,
+    residual: s1.residualNext,
+    input: {
+      adjudications: [{ phi1: "x=true", phi2: "x=false", winner: "x=true" }],
+    },
+    proposals: [winnerAction],
+  });
+  assert.equal(s2.actionsApproved.length, 1, "setup: winner action is approved");
+  assert.equal(s2.emittedRevocable.length, 1, "setup: winner action is tracked as revocable");
+
+  const s3 = step({
+    state: s2.stateNext,
+    residual: s2.residualNext,
+    input: {
+      constraints: [tension],
+      reopenSignals: [
+        {
+          phi1: "x=true",
+          phi2: "x=false",
+          source: "incident:4521",
+          reason: "conflicting post-adjudication telemetry",
+        },
+      ],
+    },
+    proposals: [],
+    priorRevocable: s2.emittedRevocable,
+  });
+
+  assert.equal(s3.reopenApplied.length, 1, "explicit reopen signal is honored");
+  assert.equal(s3.reopenBlocked.length, 0, "explicit reopen should not be reported as blocked");
+  assert.equal(s3.residualNext.tensions.length, 1, "explicit reopen rematerializes unresolved tension");
+  assert.ok(!s3.stateNext.rejected.includes("x=false"), "loser is no longer permanently rejected after explicit reopen");
+  assert.ok(
+    !s3.stateNext.commitments.some(
+      (constraint) => constraint.type === "Prop" && constraint.phi === "x=true"
+    ),
+    "winner commitment is cleared when reopening the previously resolved tension"
+  );
+  assert.equal(s3.revokedActions.length, 1, "reopened tension revokes prior revocable winner action");
+  assert.equal(s3.revokedActions[0].type, "USE_X_TRUE");
 });
 
 test("evidence gap escalation: promoted deferred respects original threshold, not zero", () => {

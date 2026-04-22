@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import Database from "better-sqlite3";
 import { SessionManager } from "../mcp/sessions";
-import { DatabaseSync } from "node:sqlite";
 import { step } from "../runtime/engine";
 import { createFileLog } from "../runtime/fileAdapter";
 import { createEmptyResidual, createInitialState } from "../runtime/model";
@@ -132,7 +132,7 @@ test("SessionManager defaults to sqlite WAL store with required indexes", () => 
     manager.newSession({ sessionId: "sqlite-check" });
     const dbPath = manager.getLogPath("sqlite-check");
 
-    const db = new DatabaseSync(dbPath, { readOnly: true });
+    const db = new Database(dbPath, { readonly: true });
     try {
       const mode = db.prepare("PRAGMA journal_mode").get() as
         | { journal_mode?: string }
@@ -321,6 +321,68 @@ test("SessionManager allows non-conflicting parallel actions in the same branch"
     assert.equal(second.actionsBlocked.length, 0);
     assert.equal(second.sessionConflicts.length, 0);
     assert.equal(second.sessionArbitrations.length, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager holds resource claims across later steps until explicitly released", () => {
+  const dir = makeTmpDir();
+
+  try {
+    const manager = new SessionManager(dir);
+    manager.newSession({ sessionId: "ticket-a" });
+    manager.newSession({ sessionId: "ticket-b" });
+
+    const first = manager.stepSession("ticket-a", {
+      context: { branch: "feature/shared", worktreeId: "wt-shared" },
+      proposals: [{ kind: "action", type: "WRITE_A", writeSet: ["resource:a"] }],
+    });
+    assert.equal(first.actionsApproved.length, 1);
+
+    const second = manager.stepSession("ticket-a", {
+      context: { branch: "feature/shared", worktreeId: "wt-shared" },
+      proposals: [{ kind: "action", type: "WRITE_B", writeSet: ["resource:b"] }],
+    });
+    assert.equal(second.actionsApproved.length, 1);
+
+    const blocked = manager.stepSession("ticket-b", {
+      context: { branch: "feature/shared", worktreeId: "wt-shared" },
+      proposals: [{ kind: "action", type: "WRITE_A_2", writeSet: ["resource:a"] }],
+    });
+    assert.equal(blocked.actionsApproved.length, 0);
+    assert.equal(blocked.actionsBlocked.length, 1);
+
+    const released = manager.updateSession("ticket-a", {
+      releaseResourceClaims: true,
+    });
+    assert.equal(released.heldResourceClaims.length, 0);
+
+    const unblocked = manager.stepSession("ticket-b", {
+      context: { branch: "feature/shared", worktreeId: "wt-shared" },
+      proposals: [{ kind: "action", type: "WRITE_A_AFTER_RELEASE", writeSet: ["resource:a"] }],
+    });
+    assert.equal(unblocked.actionsApproved.length, 1);
+    assert.equal(unblocked.actionsBlocked.length, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager requires fresh context for resource claims", () => {
+  const dir = makeTmpDir();
+
+  try {
+    const manager = new SessionManager(dir);
+    manager.newSession({ sessionId: "ticket-a" });
+
+    assert.throws(
+      () =>
+        manager.stepSession("ticket-a", {
+          proposals: [{ kind: "action", type: "WRITE_A", writeSet: ["resource:a"] }],
+        }),
+      /branch or worktree context/
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

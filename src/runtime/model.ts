@@ -12,11 +12,14 @@ export type {
   EventContext,
   Action,
   Proposal,
+  ReopenSignal,
   Input,
   TensionTimeoutPolicy,
   ResidualLimits,
   ResidualDelta,
   UnblockAnalysis,
+  AcquisitionMove,
+  BlockerCertificate,
 } from "./types/domain";
 export { createEmptyResidual, createInitialState, ageOf } from "./types/domain";
 
@@ -26,6 +29,8 @@ export type {
   OscillationEvent,
   ResidualOverflowEvent,
   InvalidAdjudicationEvent,
+  ReopenAppliedEvent,
+  ReopenBlockedEvent,
   SoftBlockedAction,
   ActionCausalAnnotation,
   SessionConflictType,

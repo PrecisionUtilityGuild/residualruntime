@@ -1,6 +1,6 @@
 # Why Residual Runtime Exists
 
-## The one thing no other system does
+## A capability many systems still do not provide natively
 
 When an AI agent proposes an action, every existing runtime asks one of three questions:
 
@@ -12,7 +12,7 @@ Residual Runtime asks a fourth question:
 
 **Is the world coherent enough right now for this action to be valid?**
 
-No other system in production or research answers this. That gap is what this kernel fills.
+Many production frameworks and governance layers still do not answer this in a native, typed form. That gap is what this kernel is designed to fill.
 
 ---
 
@@ -30,11 +30,13 @@ In those conditions, the action is blocked. Not because a rule says so. Because 
 
 When the world resolves — the tension adjudicates, the evidence arrives, the commitment satisfies — the block lifts automatically.
 
+Resolved tensions do not silently reopen. Reopening requires an explicit, provenance-carrying signal (`input.reopenSignals` with `phi1`, `phi2`, `source`, `reason`), so agents cannot accidentally reintroduce already-adjudicated losing branches.
+
 ---
 
 ## Why the other approaches don't cover this
 
-**Orchestration frameworks** (LangGraph, CrewAI) manage task order. Their state is a data bag threaded between nodes. Nothing in LangGraph prevents an agent from calling an API while a dispute about the preconditions for that call is still open. You'd have to write a guard node yourself — and the framework gives you no vocabulary for disputes, evidence thresholds, or deferred commitments.
+**Orchestration frameworks** (LangGraph, CrewAI) manage task order. Their state is a data bag threaded between nodes. Out of the box, LangGraph does not prevent an agent from calling an API while a dispute about the preconditions for that call is still open. You can add guard nodes, but the framework does not provide a first-class typed vocabulary for disputes, evidence thresholds, or deferred commitments.
 
 **Rule-based enforcement** (AgentSpec, ABC, POLARIS) enforces what developers write down. AgentSpec requires you to author a trigger and predicate for every constraint you care about. ABC requires upfront specification of preconditions and invariants. These are serious systems — and they work when you can anticipate the constraints.
 
@@ -46,7 +48,7 @@ The problem: you cannot always anticipate blocking conditions at authoring time.
 
 ---
 
-## The one thing this enables that nothing else can
+## A capability few systems expose natively
 
 `whatWouldUnblock(action, residual, state)` returns the exact minimal set of changes that would make a blocked action valid:
 
@@ -60,7 +62,12 @@ The problem: you cannot always anticipate blocking conditions at authoring time.
 
 Each delta says: if you make this change, blocking is lifted. `sufficient: true` means this single change is enough on its own.
 
-No other system can answer this. The reason: answering it requires a typed, invertible residual structure. Rule-based systems can tell you "blocked." They cannot tell you "adjudicate this tension in favour of φ₁ and the action becomes valid" — because they have no residual to invert.
+Few systems expose this generically and formally today. The reason: answering it requires a typed, invertible residual structure. Rule-based systems can tell you "blocked." They usually cannot tell you "adjudicate this tension in favour of φ₁ and the action becomes valid" — because they have no residual to invert.
+
+On the MCP surface, this now appears as blocker certificates with a deliberate split:
+
+- `next` + `sufficient`/`permanent` are strict unblock semantics.
+- `recommendations` are advisory acquisition moves (`observe`, `query`, `request_approval`, `run_check`) that help agents choose useful next actions without overclaiming certainty.
 
 ---
 
@@ -84,6 +91,10 @@ Belief revision follows **AGM contraction**: resolving a tension retracts the lo
 
 Trace correctness is verified against **CCP₀** (Concurrent Constraint Programming, Saraswat 1990): every approved action corresponds to a successful `ask` on the monotone store; every blocked action to a failed `ask`. `replayLog({ ccpVerify: true })` asserts this on every replay.
 
+Adjacent influences are also practical, not rhetorical: epistemic planning work informed the focus on knowledge-level preconditions, truth-maintenance literature informed support-tracking and cascaded retraction, and runtime verification informed replay-time trace checking.
+
+Novelty boundary, stated plainly: this project does not claim a new planning logic, a new belief-revision calculus, or a new verification theory. It packages selected ideas into a runtime execution gate for agent actions.
+
 ---
 
 ## References
@@ -96,5 +107,9 @@ Trace correctness is verified against **CCP₀** (Concurrent Constraint Programm
 - [Knowledge of Preconditions Principle (arXiv 1606.07525)](https://arxiv.org/abs/1606.07525)
 - [Concurrent Constraint Programming (Saraswat, POPL 1990)](https://dl.acm.org/doi/10.1145/96709.96733)
 - [AGM Belief Revision, Semantically (2025)](https://iccl.inf.tu-dresden.de/w/images/b/b2/FRS-TOCL-2025-AGMsemantically.pdf)
+- Doyle, J. (1979). *A Truth Maintenance System*. Artificial Intelligence, 12(3), 231-272.
+- de Kleer, J. (1986). *An Assumption-based TMS*. Artificial Intelligence, 28(2), 127-162.
+- Bolander, T., & Andersen, M. B. (2011). *Epistemic Planning for Single- and Multi-Agent Systems*.
+- Leucker, M., & Schallhart, C. (2009). *A Brief Account of Runtime Verification*. Journal of Logic and Algebraic Programming, 78(5), 293-303.
 - [The Missing Layer in Agentic AI (O'Reilly)](https://www.oreilly.com/radar/the-missing-layer-in-agentic-ai/)
 - [Stanford AI Index 2026](https://www.kiteworks.com/cybersecurity-risk-management/stanford-ai-index-2026-agentic-ai-security-governance/)

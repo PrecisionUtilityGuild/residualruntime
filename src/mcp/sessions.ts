@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, extname, join, resolve } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import Database from "better-sqlite3";
 import { step } from "../runtime/engine";
 import { createFileLog } from "../runtime/fileAdapter";
 import {
@@ -49,12 +49,24 @@ export type StepSessionRequest = {
   nowMs?: number;
 };
 
+export type UpdateSessionRequest = {
+  metadata?: {
+    objectiveType?: string;
+    objectiveRef?: string;
+    title?: string;
+    status?: "active" | "closed";
+    closedAt?: number;
+  };
+  releaseResourceClaims?: boolean;
+};
+
 export type SessionSnapshot = {
   sessionId: string;
   state: State;
   residual: Residual;
   stepCount: number;
   metadata: SessionMetadata;
+  heldResourceClaims: Action[];
   lastEventContext?: EventContext;
 };
 
@@ -62,6 +74,7 @@ export type SessionListItem = {
   sessionId: string;
   stepCount: number;
   metadata: SessionMetadata;
+  heldResourceClaimCount: number;
   lastEventContext?: EventContext;
 };
 
@@ -80,7 +93,7 @@ type SessionRecord = {
   stepCount: number;
   fingerprintHistory: string[];
   activeRevocable: Action[];
-  lastApprovedActions: Action[];
+  heldResourceClaims: Action[];
   metadata: SessionMetadata;
   lastEventContext?: EventContext;
 };
@@ -89,7 +102,13 @@ type PersistedSession = {
   sessionId: string;
   metadata: SessionMetadata;
   stepCount: number;
+  heldResourceClaimCount: number;
   lastEventContext?: EventContext;
+};
+
+type SessionEnvelope = {
+  metadata: SessionMetadata;
+  heldResourceClaims: Action[];
 };
 
 function deepClone<T>(value: T): T {
@@ -105,6 +124,57 @@ function actionKey(action: Action): string {
     readSet: (action.readSet ?? []).slice().sort(),
     writeSet: (action.writeSet ?? []).slice().sort(),
   });
+}
+
+function isAction(value: unknown): value is Action {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  if (candidate.kind !== "action" || typeof candidate.type !== "string") {
+    return false;
+  }
+
+  const arrayFields = ["dependsOn", "readSet", "writeSet"] as const;
+  for (const field of arrayFields) {
+    const fieldValue = candidate[field];
+    if (
+      fieldValue !== undefined &&
+      (!Array.isArray(fieldValue) ||
+        fieldValue.some((item) => typeof item !== "string"))
+    ) {
+      return false;
+    }
+  }
+
+  if (
+    candidate.revocable !== undefined &&
+    typeof candidate.revocable !== "boolean"
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+function isResourceAction(action: Action): boolean {
+  return normalizeResourceSet(action.readSet).length > 0 ||
+    normalizeResourceSet(action.writeSet).length > 0;
+}
+
+function mergeHeldResourceClaims(current: Action[], approved: Action[]): Action[] {
+  const next = current
+    .filter(isResourceAction)
+    .map((action) => deepClone(action));
+  const seen = new Set(next.map(actionKey));
+
+  for (const action of approved) {
+    if (!isResourceAction(action)) continue;
+    const key = actionKey(action);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    next.push(deepClone(action));
+  }
+
+  return next;
 }
 
 function normalizeResourceSet(values?: string[]): string[] {
@@ -247,6 +317,39 @@ function parseSessionMetadata(raw: unknown): SessionMetadata | undefined {
   return metadata;
 }
 
+function parseHeldResourceClaims(raw: unknown): Action[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter(isAction).filter(isResourceAction).map((action) => deepClone(action));
+}
+
+function parseSessionEnvelope(raw: unknown): SessionEnvelope | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+
+  const candidate = raw as Record<string, unknown>;
+  if ("metadata" in candidate) {
+    const metadata = parseSessionMetadata(candidate.metadata);
+    if (!metadata) return undefined;
+    return {
+      metadata,
+      heldResourceClaims: parseHeldResourceClaims(candidate.heldResourceClaims),
+    };
+  }
+
+  const metadata = parseSessionMetadata(raw);
+  if (!metadata) return undefined;
+  return {
+    metadata,
+    heldResourceClaims: [],
+  };
+}
+
+function serializeSessionEnvelope(envelope: SessionEnvelope): string {
+  return JSON.stringify({
+    metadata: envelope.metadata,
+    heldResourceClaims: envelope.heldResourceClaims,
+  });
+}
+
 function parseEventContext(raw: unknown): EventContext | undefined {
   if (!raw || typeof raw !== "object") return undefined;
   const context = raw as Record<string, unknown>;
@@ -286,6 +389,39 @@ function uniquePreservingOrder(values: string[]): string[] {
   return unique;
 }
 
+function applySessionMetadataPatch(
+  current: SessionMetadata,
+  patch?: UpdateSessionRequest["metadata"]
+): SessionMetadata {
+  if (!patch) return deepClone(current);
+
+  const status = patch.status ?? current.status;
+  const closedAt =
+    status === "closed"
+      ? patch.closedAt ?? current.closedAt ?? Date.now()
+      : undefined;
+
+  if (closedAt !== undefined && closedAt < current.createdAt) {
+    throw new Error("closedAt cannot be earlier than createdAt");
+  }
+
+  return {
+    objectiveType:
+      patch.objectiveType !== undefined
+        ? trimToOptionalString(patch.objectiveType)
+        : current.objectiveType,
+    objectiveRef:
+      patch.objectiveRef !== undefined
+        ? trimToOptionalString(patch.objectiveRef)
+        : current.objectiveRef,
+    title:
+      patch.title !== undefined ? trimToOptionalString(patch.title) : current.title,
+    status,
+    createdAt: current.createdAt,
+    closedAt,
+  };
+}
+
 function resolveSessionRootDir(rootDir?: string): string {
   const explicitRoot = rootDir?.trim();
   const envRoot = process.env.RESIDUAL_SESSION_ROOT_DIR?.trim();
@@ -322,11 +458,11 @@ function resolveSessionRootDir(rootDir?: string): string {
 
 class SessionSqliteStore {
   private readonly databasePath: string;
-  private readonly db: DatabaseSync;
+  private readonly db: InstanceType<typeof Database>;
 
   constructor(rootDir: string) {
     this.databasePath = join(rootDir, SESSION_DB_FILENAME);
-    this.db = new DatabaseSync(this.databasePath);
+    this.db = new Database(this.databasePath);
     this.initializeSchema();
   }
 
@@ -379,10 +515,15 @@ class SessionSqliteStore {
         `INSERT INTO sessions(session_id, metadata_json, created_at, updated_at)
          VALUES (?, ?, ?, ?)`
       )
-      .run(sessionId, JSON.stringify(metadata), nowMs, nowMs);
+      .run(
+        sessionId,
+        serializeSessionEnvelope({ metadata, heldResourceClaims: [] }),
+        nowMs,
+        nowMs
+      );
   }
 
-  getSessionMetadata(sessionId: string): SessionMetadata | undefined {
+  getSessionEnvelope(sessionId: string): SessionEnvelope | undefined {
     const row = this.db
       .prepare("SELECT metadata_json FROM sessions WHERE session_id = ?")
       .get(sessionId) as { metadata_json: string } | undefined;
@@ -390,9 +531,17 @@ class SessionSqliteStore {
     if (!row) return undefined;
 
     try {
-      return parseSessionMetadata(JSON.parse(row.metadata_json)) ?? normalizeSessionMetadata();
+      return (
+        parseSessionEnvelope(JSON.parse(row.metadata_json)) ?? {
+          metadata: normalizeSessionMetadata(),
+          heldResourceClaims: [],
+        }
+      );
     } catch {
-      return normalizeSessionMetadata();
+      return {
+        metadata: normalizeSessionMetadata(),
+        heldResourceClaims: [],
+      };
     }
   }
 
@@ -413,7 +562,13 @@ class SessionSqliteStore {
     return events;
   }
 
-  appendSessionEvent(sessionId: string, stepIndex: number, event: ReplayEvent): void {
+  appendSessionEvent(
+    sessionId: string,
+    stepIndex: number,
+    event: ReplayEvent,
+    metadata: SessionMetadata,
+    heldResourceClaims: Action[]
+  ): void {
     const nowMs = Date.now();
     this.db.exec("BEGIN IMMEDIATE;");
     try {
@@ -425,14 +580,37 @@ class SessionSqliteStore {
         .run(sessionId, stepIndex, nowMs, JSON.stringify(event));
 
       this.db
-        .prepare("UPDATE sessions SET updated_at = ? WHERE session_id = ?")
-        .run(nowMs, sessionId);
+        .prepare(
+          "UPDATE sessions SET metadata_json = ?, updated_at = ? WHERE session_id = ?"
+        )
+        .run(
+          serializeSessionEnvelope({ metadata, heldResourceClaims }),
+          nowMs,
+          sessionId
+        );
 
       this.db.exec("COMMIT;");
     } catch (error: unknown) {
       this.db.exec("ROLLBACK;");
       throw error;
     }
+  }
+
+  updateSession(
+    sessionId: string,
+    metadata: SessionMetadata,
+    heldResourceClaims: Action[]
+  ): void {
+    const nowMs = Date.now();
+    this.db
+      .prepare(
+        "UPDATE sessions SET metadata_json = ?, updated_at = ? WHERE session_id = ?"
+      )
+      .run(
+        serializeSessionEnvelope({ metadata, heldResourceClaims }),
+        nowMs,
+        sessionId
+      );
   }
 
   listSessions(): PersistedSession[] {
@@ -462,9 +640,12 @@ class SessionSqliteStore {
     }>;
 
     return rows.map((row) => {
-      let metadata = normalizeSessionMetadata();
+      let envelope: SessionEnvelope = {
+        metadata: normalizeSessionMetadata(),
+        heldResourceClaims: [],
+      };
       try {
-        metadata = parseSessionMetadata(JSON.parse(row.metadata_json)) ?? metadata;
+        envelope = parseSessionEnvelope(JSON.parse(row.metadata_json)) ?? envelope;
       } catch {
         // Keep normalized fallback.
       }
@@ -481,8 +662,9 @@ class SessionSqliteStore {
 
       return {
         sessionId: row.session_id,
-        metadata,
+        metadata: envelope.metadata,
         stepCount: Number(row.step_count),
+        heldResourceClaimCount: envelope.heldResourceClaims.length,
         lastEventContext,
       };
     });
@@ -591,14 +773,19 @@ export class SessionManager {
       throw new Error(`Session "${sessionId}" not found`);
     }
 
-    const metadata = this.store.getSessionMetadata(sessionId) ?? normalizeSessionMetadata();
+    const envelope =
+      this.store.getSessionEnvelope(sessionId) ?? {
+        metadata: normalizeSessionMetadata(),
+        heldResourceClaims: [],
+      };
+    const metadata = envelope.metadata;
     const events = this.store.readSessionEvents(sessionId);
 
     let state = createInitialState();
     let residual = createEmptyResidual();
     let fingerprintHistory: string[] = [];
     let activeRevocable: Action[] = [];
-    let lastApprovedActions: Action[] = [];
+    const heldResourceClaims = deepClone(envelope.heldResourceClaims);
     let lastEventContext: EventContext | undefined = undefined;
 
     for (const event of events) {
@@ -606,7 +793,6 @@ export class SessionManager {
       residual = deepClone(event.after.residual);
       fingerprintHistory = [...fingerprintHistory, computeFingerprint(residual)];
       activeRevocable = reconcileRevocableActions(activeRevocable, event.approvedActions, residual, state);
-      lastApprovedActions = deepClone(event.approvedActions);
       if (event.context) {
         lastEventContext = deepClone(event.context);
       }
@@ -619,7 +805,7 @@ export class SessionManager {
       stepCount: events.length,
       fingerprintHistory,
       activeRevocable,
-      lastApprovedActions,
+      heldResourceClaims,
       metadata,
       lastEventContext,
     };
@@ -651,7 +837,7 @@ export class SessionManager {
       stepCount: 0,
       fingerprintHistory: [],
       activeRevocable: [],
-      lastApprovedActions: [],
+      heldResourceClaims: [],
       metadata,
       lastEventContext: undefined,
     };
@@ -692,7 +878,7 @@ export class SessionManager {
       const scope = resolveSharedScope(context, loaded.lastEventContext);
       if (!scope) continue;
 
-      for (const action of loaded.lastApprovedActions) {
+      for (const action of loaded.heldResourceClaims) {
         const readSet = normalizeResourceSet(action.readSet);
         const writeSet = normalizeResourceSet(action.writeSet);
         if (readSet.length === 0 && writeSet.length === 0) continue;
@@ -917,7 +1103,16 @@ export class SessionManager {
       nowMs: request.nowMs,
     });
 
-    const conflictContext = request.context ?? session.lastEventContext;
+    if (
+      request.context === undefined &&
+      result.actionsApproved.some(isResourceAction)
+    ) {
+      throw new Error(
+        `Session "${sessionId}" must provide branch or worktree context when proposing actions with readSet/writeSet.`
+      );
+    }
+
+    const conflictContext = request.context;
     const conflictGate = this.applyCrossSessionConflictGate(
       sessionId,
       session.metadata,
@@ -952,8 +1147,19 @@ export class SessionManager {
       ...(request.context ? { context: deepClone(request.context) } : {}),
     };
 
+    const nextHeldResourceClaims = mergeHeldResourceClaims(
+      session.heldResourceClaims,
+      actionsApproved
+    );
+
     try {
-      this.store.appendSessionEvent(sessionId, session.stepCount, replay);
+      this.store.appendSessionEvent(
+        sessionId,
+        session.stepCount,
+        replay,
+        session.metadata,
+        nextHeldResourceClaims
+      );
     } catch (error: unknown) {
       if (isSessionStepConflictError(error)) {
         this.sessions.delete(sessionId);
@@ -968,7 +1174,7 @@ export class SessionManager {
     session.residual = deepClone(result.residualNext);
     session.stepCount += 1;
     session.fingerprintHistory = [...result.fingerprintHistory];
-    session.lastApprovedActions = deepClone(actionsApproved);
+    session.heldResourceClaims = nextHeldResourceClaims;
     if (request.context) {
       session.lastEventContext = deepClone(request.context);
     }
@@ -993,6 +1199,21 @@ export class SessionManager {
     };
   }
 
+  updateSession(sessionId: string, request: UpdateSessionRequest): SessionSnapshot {
+    const session = this.loadSession(sessionId);
+    const metadata = applySessionMetadataPatch(session.metadata, request.metadata);
+    const heldResourceClaims =
+      request.releaseResourceClaims === true || metadata.status === "closed"
+        ? []
+        : deepClone(session.heldResourceClaims);
+
+    this.store.updateSession(sessionId, metadata, heldResourceClaims);
+    session.metadata = deepClone(metadata);
+    session.heldResourceClaims = deepClone(heldResourceClaims);
+
+    return this.getState(sessionId);
+  }
+
   getState(sessionId: string): SessionSnapshot {
     const session = this.loadSession(sessionId);
     return {
@@ -1001,6 +1222,7 @@ export class SessionManager {
       residual: deepClone(session.residual),
       stepCount: session.stepCount,
       metadata: deepClone(session.metadata),
+      heldResourceClaims: deepClone(session.heldResourceClaims),
       lastEventContext: session.lastEventContext
         ? deepClone(session.lastEventContext)
         : undefined,
@@ -1013,6 +1235,7 @@ export class SessionManager {
       sessionId: item.sessionId,
       stepCount: item.stepCount,
       metadata: deepClone(item.metadata),
+      heldResourceClaimCount: item.heldResourceClaimCount,
       lastEventContext: item.lastEventContext
         ? deepClone(item.lastEventContext)
         : undefined,

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { whatWouldUnblock } from "../runtime/predicates";
+import { blockerCertificates, whatWouldUnblock } from "../runtime/predicates";
 import { createEmptyResidual, createInitialState } from "../runtime/model";
 import type { Action, ResidualDelta } from "../runtime/model";
 
@@ -216,4 +216,125 @@ test("whatWouldUnblock: permanent=true is distinct from already-unblocked (perma
   assert.deepEqual(permanentResult.deltas, []);
   assert.equal(freeResult.permanent, false, "no blocker → not permanent");
   assert.deepEqual(freeResult.deltas, []);
+});
+
+test("blockerCertificates: uses one typed tension certificate instead of per-winner delta duplication", () => {
+  const residual = {
+    ...createEmptyResidual(),
+    tensions: [{ kind: "tension" as const, phi1: "ship_fast", phi2: "full_review" }],
+  };
+  const targetAction = action("DEPLOY", ["ship_fast"]);
+
+  const legacy = whatWouldUnblock(targetAction, residual, createInitialState());
+  const certificates = blockerCertificates(targetAction, residual, createInitialState());
+
+  assert.equal(legacy.deltas.length, 2, "legacy shape emits one delta per tension winner candidate");
+  assert.equal(certificates.length, 1, "certificate shape collapses tension explanation to one typed certificate");
+  assert.equal(certificates[0].blockerType, "epistemic_tension");
+  assert.equal(certificates[0].next.kind, "adjudicate_tension");
+});
+
+test("blockerCertificates: preserves typed mixed multi-blocker actionability", () => {
+  const residual = {
+    ...createEmptyResidual(),
+    tensions: [{ kind: "tension" as const, phi1: "approve", phi2: "reject" }],
+    evidenceGaps: [{ kind: "evidence_gap" as const, phi: "risk_score", threshold: 0.9 }],
+  };
+
+  const certificates = blockerCertificates(
+    action("COMMIT", ["approve", "risk_score"]),
+    residual,
+    createInitialState()
+  );
+
+  assert.equal(certificates.length, 2, "mixed blockers should produce one certificate per blocker family");
+  assert.ok(
+    certificates.some(
+      (certificate) =>
+        certificate.blockerType === "epistemic_tension" &&
+        certificate.next.kind === "adjudicate_tension"
+    )
+  );
+  assert.ok(
+    certificates.some(
+      (certificate) =>
+        certificate.blockerType === "epistemic_evidence_gap" &&
+        certificate.next.kind === "provide_evidence"
+    )
+  );
+});
+
+test("blockerCertificates: evidence-gap certificates include advisory acquisition moves", () => {
+  const residual = {
+    ...createEmptyResidual(),
+    evidenceGaps: [{ kind: "evidence_gap" as const, phi: "lab_result", threshold: 0.92 }],
+  };
+
+  const certificates = blockerCertificates(
+    action("ADMINISTER_MEDICATION", ["lab_result"]),
+    residual,
+    createInitialState()
+  );
+
+  assert.equal(certificates.length, 1);
+  assert.equal(certificates[0].blockerType, "epistemic_evidence_gap");
+  assert.equal(certificates[0].recommendations.semantics, "advisory");
+  assert.ok(
+    certificates[0].recommendations.moves.some((move) => move.kind === "run_check"),
+    "evidence gap should recommend running checks"
+  );
+  assert.ok(
+    certificates[0].recommendations.moves.some((move) => move.kind === "query"),
+    "evidence gap should recommend querying available evidence"
+  );
+});
+
+test("blockerCertificates: deferred approval blockers recommend request_approval", () => {
+  const residual = {
+    ...createEmptyResidual(),
+    deferred: [
+      {
+        kind: "deferred" as const,
+        constraint: { type: "Prop" as const, phi: "attending_signoff" },
+        dependencies: ["attending_available"],
+      },
+    ],
+  };
+
+  const certificates = blockerCertificates(
+    action("ADMINISTER_MEDICATION", ["attending_signoff"]),
+    residual,
+    createInitialState()
+  );
+
+  assert.equal(certificates.length, 1);
+  assert.equal(certificates[0].blockerType, "epistemic_deferred");
+  assert.ok(
+    certificates[0].recommendations.moves.some((move) => move.kind === "request_approval"),
+    "deferred Prop dependency should recommend approval chasing"
+  );
+});
+
+test("blockerCertificates: tension blockers recommend query and observation moves", () => {
+  const residual = {
+    ...createEmptyResidual(),
+    tensions: [{ kind: "tension" as const, phi1: "go_live", phi2: "hold_release" }],
+  };
+
+  const certificates = blockerCertificates(
+    action("DEPLOY", ["go_live"]),
+    residual,
+    createInitialState()
+  );
+
+  assert.equal(certificates.length, 1);
+  assert.equal(certificates[0].blockerType, "epistemic_tension");
+  assert.ok(
+    certificates[0].recommendations.moves.some((move) => move.kind === "query"),
+    "tension should recommend gathering adjudication evidence"
+  );
+  assert.ok(
+    certificates[0].recommendations.moves.some((move) => move.kind === "observe"),
+    "tension should recommend waiting for adjudication updates when needed"
+  );
 });

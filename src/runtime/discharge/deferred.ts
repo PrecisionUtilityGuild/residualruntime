@@ -1,4 +1,9 @@
 import type { Deferred, Residual, State } from "../model";
+import {
+  constraintIsExplicitlyMaterialized,
+  constraintIsSatisfiedFromState,
+  materializeDeferredConstraint,
+} from "../deferredState";
 
 function dependencyStillUnresolved(dep: string, residual: Residual, state: State, d: Deferred): boolean {
   if (dep.startsWith("evidence:")) {
@@ -28,10 +33,14 @@ function dependencyStillUnresolved(dep: string, residual: Residual, state: State
 
 export function dischargeDeferred(residual: Residual, state: State): void {
   residual.deferred = residual.deferred.filter((d) => {
+    if (constraintIsExplicitlyMaterialized(d.constraint, residual, state)) {
+      return false;
+    }
+
     const unresolvedDep = d.dependencies.some((dep) => dependencyStillUnresolved(dep, residual, state, d));
 
-    if (!unresolvedDep) {
-      state.commitments.push(d.constraint);
+    if (!unresolvedDep || constraintIsSatisfiedFromState(d.constraint, state)) {
+      materializeDeferredConstraint(d, residual, state);
       return false;
     }
     d.stepsStuck = (d.stepsStuck ?? 0) + 1;

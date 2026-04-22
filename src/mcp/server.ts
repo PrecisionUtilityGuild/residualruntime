@@ -3,16 +3,25 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { whatWouldUnblock } from "../runtime/predicates";
+import { blockerCertificates } from "../runtime/predicates";
 import type {
+  Action,
+  AcquisitionMove,
+  BlockerCertificate,
   EventContext,
   Input,
   Proposal,
   Residual,
   ResidualLimits,
+  SessionArbitrationEvent,
+  SessionConflictEvent,
   TensionTimeoutPolicy,
 } from "../runtime/model";
-import { SessionManager, type StepSessionRequest } from "./sessions";
+import {
+  SessionManager,
+  type StepSessionRequest,
+  type UpdateSessionRequest,
+} from "./sessions";
 
 type MappedTensionTimeoutPolicy = {
   maxSteps: number;
@@ -121,6 +130,18 @@ const inputSchema = z
             phi1: nonEmptyStringSchema,
             phi2: nonEmptyStringSchema,
             winner: nonEmptyStringSchema,
+          })
+          .strict()
+      )
+      .optional(),
+    reopenSignals: z
+      .array(
+        z
+          .object({
+            phi1: nonEmptyStringSchema,
+            phi2: nonEmptyStringSchema,
+            source: nonEmptyStringSchema,
+            reason: nonEmptyStringSchema,
           })
           .strict()
       )
@@ -252,8 +273,36 @@ const newSessionArgsSchema = z
   })
   .strict();
 
+const sessionMetadataPatchSchema = z
+  .object({
+    objectiveType: nonEmptyStringSchema.optional(),
+    objectiveRef: nonEmptyStringSchema.optional(),
+    title: nonEmptyStringSchema.optional(),
+    status: z.enum(["active", "closed"]).optional(),
+    closedAt: z.number().int().nonnegative().optional(),
+  })
+  .strict()
+  .superRefine((value, ctx) => {
+    if (value.status === "active" && value.closedAt !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["closedAt"],
+        message: "closedAt cannot be provided when status is active",
+      });
+    }
+  });
+
+const updateSessionArgsSchema = z
+  .object({
+    sessionId: nonEmptyStringSchema,
+    metadata: sessionMetadataPatchSchema.optional(),
+    releaseResourceClaims: z.boolean().optional(),
+  })
+  .strict();
+
 type StepArgs = z.infer<typeof stepArgsSchema>;
 type NewSessionArgs = z.infer<typeof newSessionArgsSchema>;
+type UpdateSessionArgs = z.infer<typeof updateSessionArgsSchema>;
 
 function toToolResponse(payload: Record<string, unknown>) {
   return {
@@ -304,14 +353,23 @@ function mapStepRequest(args: {
   };
 }
 
-function summarizeResidual(residual: Residual) {
+function summarizeResidualCounts(residual: Residual) {
+  const counts = {
+    assumptions: residual.assumptions.length,
+    deferred: residual.deferred.length,
+    tensions: residual.tensions.length,
+    evidenceGaps: residual.evidenceGaps.length,
+  };
+
   return {
-    counts: {
-      assumptions: residual.assumptions.length,
-      deferred: residual.deferred.length,
-      tensions: residual.tensions.length,
-      evidenceGaps: residual.evidenceGaps.length,
-    },
+    counts,
+    hasOpenBlockers: counts.deferred + counts.tensions + counts.evidenceGaps > 0,
+  };
+}
+
+function summarizeResidualVerbose(residual: Residual) {
+  return {
+    ...summarizeResidualCounts(residual),
     assumptions: residual.assumptions,
     deferred: residual.deferred,
     tensions: residual.tensions,
@@ -319,13 +377,130 @@ function summarizeResidual(residual: Residual) {
   };
 }
 
-function actionKey(action: { type: string; dependsOn?: string[]; readSet?: string[]; writeSet?: string[] }): string {
+function actionKey(action: Action): string {
   return JSON.stringify({
     type: action.type,
     dependsOn: (action.dependsOn ?? []).slice().sort(),
     readSet: (action.readSet ?? []).slice().sort(),
     writeSet: (action.writeSet ?? []).slice().sort(),
+    revocable: action.revocable === true,
   });
+}
+
+function dedupeMoves(moves: AcquisitionMove[]): AcquisitionMove[] {
+  const seen = new Set<string>();
+  const deduped: AcquisitionMove[] = [];
+  for (const move of moves) {
+    const key = `${move.kind}|${move.target}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(move);
+  }
+  return deduped;
+}
+
+function sessionCoordinationRecommendations(args: {
+  conflict: SessionConflictEvent;
+  arbitration?: SessionArbitrationEvent;
+}): AcquisitionMove[] {
+  const { conflict, arbitration } = args;
+  const base: AcquisitionMove[] = [
+    {
+      kind: "query",
+      target: `session:${conflict.otherSessionId}/resource:${conflict.resource}`,
+      reason: "Query ownership and expected release/merge timing for the conflicting resource.",
+    },
+  ];
+
+  const mode = arbitration?.mode;
+  const outcome = arbitration?.outcome;
+
+  if (mode === "branch_split_required" || outcome === "branch_split_required") {
+    base.push({
+      kind: "request_approval",
+      target: `coordination:${conflict.resource}`,
+      reason: "Request a branch-split or merge-plan decision to resolve the coordination conflict.",
+    });
+  } else {
+    base.push({
+      kind: "observe",
+      target: `resource:${conflict.resource}`,
+      reason: "Observe until the conflicting claim is released, then retry the blocked action.",
+    });
+  }
+
+  return dedupeMoves(base);
+}
+
+function buildSessionCertificates(
+  action: Action,
+  sessionConflicts: SessionConflictEvent[],
+  sessionArbitrations: SessionArbitrationEvent[]
+): BlockerCertificate[] {
+  const actionScopedConflicts = sessionConflicts.filter(
+    (conflict) => actionKey(conflict.action) === actionKey(action)
+  );
+  const arbitrationByConflictKey = new Map(
+    sessionArbitrations
+      .filter((arbitration) => actionKey(arbitration.action) === actionKey(action))
+      .map((arbitration) => [
+        `${arbitration.conflictType}|${arbitration.resource}|${arbitration.otherSessionId}`,
+        arbitration,
+      ])
+  );
+
+  const certificates: BlockerCertificate[] = [];
+  for (const conflict of actionScopedConflicts) {
+    const certificateKey = `${conflict.conflictType}|${conflict.resource}|${conflict.otherSessionId}`;
+    const arbitration = arbitrationByConflictKey.get(certificateKey);
+    certificates.push({
+      blockerId: `session:${certificateKey}`,
+      blockerType: "session_coordination",
+      atoms: [conflict.resource],
+      permanent: false,
+      sufficient: false,
+      recommendations: {
+        semantics: "advisory",
+        moves: sessionCoordinationRecommendations({ conflict, arbitration }),
+      },
+      next: {
+        kind: "coordinate_session",
+        conflictType: conflict.conflictType,
+        resource: conflict.resource,
+        otherSessionId: conflict.otherSessionId,
+        mode: arbitration?.mode,
+        outcome: arbitration?.outcome,
+        unblock: (arbitration?.unblock ?? conflict.unblock).map((item) => ({
+          kind: item.kind,
+          detail: item.detail,
+        })),
+      },
+    });
+  }
+
+  return certificates;
+}
+
+function summarizeBlockedActions(args: {
+  actionsBlocked: Action[];
+  residual: Residual;
+  state: ReturnType<SessionManager["getState"]>["state"];
+  sessionConflicts: SessionConflictEvent[];
+  sessionArbitrations: SessionArbitrationEvent[];
+}) {
+  return {
+    blocked: args.actionsBlocked.map((action) => ({
+      action,
+      certificates: [
+        ...blockerCertificates(action, args.residual, args.state),
+        ...buildSessionCertificates(
+          action,
+          args.sessionConflicts,
+          args.sessionArbitrations
+        ),
+      ],
+    })),
+  };
 }
 
 export function createResidualMcpServer(options?: { sessionRootDir?: string }) {
@@ -346,47 +521,30 @@ export function createResidualMcpServer(options?: { sessionRootDir?: string }) {
     "step",
     {
       description:
-        "Advance one shared session step with optional proposals and input, then return approved/blocked actions, unblock deltas, residual summary, and events.",
+        "Advance one shared session step with optional proposals and input, then return approved actions, blocker certificates (strict unblock semantics plus advisory acquisition moves), residual counts, and events.",
       inputSchema: stepArgsSchema,
     },
     async (args: StepArgs) => {
       const request = mapStepRequest(args);
       const result = sessionManager.stepSession(args.sessionId, request);
       const snapshot = sessionManager.getState(args.sessionId);
-      const conflictsByAction = new Map<string, typeof result.sessionConflicts>();
-      const arbitrationsByAction = new Map<
-        string,
-        typeof result.sessionArbitrations
-      >();
-      for (const conflict of result.sessionConflicts) {
-        const key = actionKey(conflict.action);
-        const existing = conflictsByAction.get(key);
-        if (existing) existing.push(conflict);
-        else conflictsByAction.set(key, [conflict]);
-      }
-      for (const arbitration of result.sessionArbitrations) {
-        const key = actionKey(arbitration.action);
-        const existing = arbitrationsByAction.get(key);
-        if (existing) existing.push(arbitration);
-        else arbitrationsByAction.set(key, [arbitration]);
-      }
-
-      const blockedWithUnblock = result.actionsBlocked.map((action) => ({
-        action,
-        analysis: whatWouldUnblock(action, result.residualNext, result.stateNext),
-        sessionConflicts: conflictsByAction.get(actionKey(action)) ?? [],
-        sessionArbitrations: arbitrationsByAction.get(actionKey(action)) ?? [],
-      }));
+      const blockedSummary = summarizeBlockedActions({
+        actionsBlocked: result.actionsBlocked,
+        residual: result.residualNext,
+        state: result.stateNext,
+        sessionConflicts: result.sessionConflicts,
+        sessionArbitrations: result.sessionArbitrations,
+      });
 
       return toToolResponse({
         sessionId: args.sessionId,
         stepCount: snapshot.stepCount,
         metadata: snapshot.metadata,
+        heldResourceClaims: snapshot.heldResourceClaims,
         lastEventContext: snapshot.lastEventContext,
         actionsApproved: result.actionsApproved,
-        actionsBlocked: result.actionsBlocked,
-        whatWouldUnblock: blockedWithUnblock,
-        residualSummary: summarizeResidual(result.residualNext),
+        ...blockedSummary,
+        residualSummary: summarizeResidualCounts(result.residualNext),
         events: {
           escalations: result.escalations,
           deadlocks: result.deadlocks,
@@ -395,6 +553,8 @@ export function createResidualMcpServer(options?: { sessionRootDir?: string }) {
           invalidAdjudications: result.invalidAdjudications,
           autoAdjudications: result.autoAdjudications,
           revokedActions: result.revokedActions,
+          reopenApplied: result.reopenApplied,
+          reopenBlocked: result.reopenBlocked,
           sessionArbitrationPolicy: result.sessionArbitrationPolicy,
           sessionConflicts: result.sessionConflicts,
           sessionArbitrations: result.sessionArbitrations,
@@ -416,10 +576,11 @@ export function createResidualMcpServer(options?: { sessionRootDir?: string }) {
         sessionId: args.sessionId,
         stepCount: snapshot.stepCount,
         metadata: snapshot.metadata,
+        heldResourceClaims: snapshot.heldResourceClaims,
         lastEventContext: snapshot.lastEventContext,
         state: snapshot.state,
         residual: snapshot.residual,
-        residualSummary: summarizeResidual(snapshot.residual),
+        residualSummary: summarizeResidualVerbose(snapshot.residual),
       });
     }
   );
@@ -452,8 +613,35 @@ export function createResidualMcpServer(options?: { sessionRootDir?: string }) {
         sessionId: snapshot.sessionId,
         stepCount: snapshot.stepCount,
         metadata: snapshot.metadata,
+        heldResourceClaims: snapshot.heldResourceClaims,
         lastEventContext: snapshot.lastEventContext,
         sessionPath: sessionManager.getLogPath(snapshot.sessionId),
+        state: snapshot.state,
+        residual: snapshot.residual,
+      });
+    }
+  );
+
+  server.registerTool(
+    "update_session",
+    {
+      description:
+        "Update session lifecycle metadata and explicitly release held resource claims.",
+      inputSchema: updateSessionArgsSchema,
+    },
+    async (args: UpdateSessionArgs) => {
+      const request: UpdateSessionRequest = {
+        metadata: args.metadata,
+        releaseResourceClaims: args.releaseResourceClaims,
+      };
+      const snapshot = sessionManager.updateSession(args.sessionId, request);
+
+      return toToolResponse({
+        sessionId: snapshot.sessionId,
+        stepCount: snapshot.stepCount,
+        metadata: snapshot.metadata,
+        heldResourceClaims: snapshot.heldResourceClaims,
+        lastEventContext: snapshot.lastEventContext,
         state: snapshot.state,
         residual: snapshot.residual,
       });

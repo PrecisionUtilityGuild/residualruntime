@@ -80,10 +80,18 @@ export type Action = {
 
 export type Proposal = Action | Assumption | Deferred | Tension | EvidenceGap;
 
+export type ReopenSignal = {
+  phi1: string;
+  phi2: string;
+  source: string;
+  reason: string;
+};
+
 export type Input = {
   evidence?: Record<string, number>;
   constraints?: Constraint[];
   adjudications?: Array<{ phi1: string; phi2: string; winner: string }>;
+  reopenSignals?: ReopenSignal[];
 };
 
 export type TensionTimeoutPolicy = {
@@ -101,6 +109,74 @@ export type ResidualDelta =
 export type UnblockAnalysis = {
   permanent: boolean;
   deltas: ResidualDelta[];
+};
+
+export type AcquisitionMove =
+  | {
+      kind: "observe";
+      target: string;
+      reason: string;
+    }
+  | {
+      kind: "query";
+      target: string;
+      reason: string;
+    }
+  | {
+      kind: "request_approval";
+      target: string;
+      reason: string;
+    }
+  | {
+      kind: "run_check";
+      target: string;
+      reason: string;
+    };
+
+export type BlockerCertificate = {
+  blockerId: string;
+  blockerType:
+    | "epistemic_rejected"
+    | "epistemic_tension"
+    | "epistemic_evidence_gap"
+    | "epistemic_deferred"
+    | "session_coordination";
+  atoms: string[];
+  permanent: boolean;
+  sufficient: boolean;
+  recommendations: {
+    semantics: "advisory";
+    moves: AcquisitionMove[];
+  };
+  next:
+    | {
+        kind: "replan_without_rejected_atom";
+        rejectedAtoms: string[];
+      }
+    | {
+        kind: "adjudicate_tension";
+        phi1: string;
+        phi2: string;
+        options: Array<{ winner: string; sufficient: boolean }>;
+      }
+    | {
+        kind: "provide_evidence";
+        phi: string;
+        minBelief: number;
+      }
+    | {
+        kind: "satisfy_dependency";
+        phi: string;
+      }
+    | {
+        kind: "coordinate_session";
+        conflictType: "write_write" | "read_write";
+        resource: string;
+        otherSessionId: string;
+        mode?: "serialize_first" | "branch_split_required";
+        outcome?: "serialize_wait" | "branch_split_required";
+        unblock: Array<{ kind: string; detail: string }>;
+      };
 };
 
 export type ResidualLimits = {

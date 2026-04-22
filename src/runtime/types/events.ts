@@ -39,6 +39,23 @@ export type InvalidAdjudicationEvent = {
   source: "auto" | "manual";
 };
 
+export type ReopenAppliedEvent = {
+  kind: "reopen_applied";
+  phi1: string;
+  phi2: string;
+  source: string;
+  reason: string;
+};
+
+export type ReopenBlockedEvent = {
+  kind: "reopen_blocked";
+  phi1: string;
+  phi2: string;
+  attemptedVia: "constraint" | "proposal" | "residual";
+  reason: string;
+  requiredSignal: "input.reopenSignals";
+};
+
 export type SoftBlockedAction = {
   action: Action;
   unmetPreferences: Array<{ phi: string; weight: number }>;
@@ -124,6 +141,10 @@ export type ReplayEvent = {
   candidateActions: Action[];
   approvedActions: Action[];
   blockedActions: Action[];
+  reopen?: {
+    applied: ReopenAppliedEvent[];
+    blocked: ReopenBlockedEvent[];
+  };
   sessionEvents?: {
     conflicts: SessionConflictEvent[];
     arbitrations: SessionArbitrationEvent[];
@@ -145,6 +166,8 @@ export type StepResult = {
   fingerprintHistory: string[];
   autoAdjudications: Array<{ phi1: string; phi2: string; winner: string }>;
   invalidAdjudications: InvalidAdjudicationEvent[];
+  reopenApplied: ReopenAppliedEvent[];
+  reopenBlocked: ReopenBlockedEvent[];
   deadlocks: DeadlockEvent[];
   sessionArbitrationPolicy: SessionArbitrationPolicy;
   sessionConflicts: SessionConflictEvent[];
