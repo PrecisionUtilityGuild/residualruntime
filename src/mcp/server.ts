@@ -3,6 +3,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { compileRepairPlan } from "../runtime/repair";
 import { blockerCertificates } from "../runtime/predicates";
 import type {
   Action,
@@ -118,6 +119,130 @@ const proposalSchema = z.discriminatedUnion("kind", [
     })
     .strict(),
 ]);
+
+const actionSchema = z
+  .object({
+    kind: z.literal("action"),
+    type: nonEmptyStringSchema,
+    dependsOn: z.array(nonEmptyStringSchema).optional(),
+    revocable: z.boolean().optional(),
+    readSet: z.array(nonEmptyStringSchema).optional(),
+    writeSet: z.array(nonEmptyStringSchema).optional(),
+  })
+  .strict();
+
+const acquisitionMoveSchema = z.discriminatedUnion("kind", [
+  z
+    .object({
+      kind: z.literal("observe"),
+      target: nonEmptyStringSchema,
+      reason: nonEmptyStringSchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("query"),
+      target: nonEmptyStringSchema,
+      reason: nonEmptyStringSchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("request_approval"),
+      target: nonEmptyStringSchema,
+      reason: nonEmptyStringSchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("run_check"),
+      target: nonEmptyStringSchema,
+      reason: nonEmptyStringSchema,
+    })
+    .strict(),
+]);
+
+const blockerDirectiveSchema = z.discriminatedUnion("kind", [
+  z
+    .object({
+      kind: z.literal("replan_without_rejected_atom"),
+      rejectedAtoms: z.array(nonEmptyStringSchema).min(1),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("adjudicate_tension"),
+      phi1: nonEmptyStringSchema,
+      phi2: nonEmptyStringSchema,
+      options: z
+        .array(
+          z
+            .object({
+              winner: nonEmptyStringSchema,
+              sufficient: z.boolean(),
+            })
+            .strict()
+        )
+        .min(1),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("provide_evidence"),
+      phi: nonEmptyStringSchema,
+      minBelief: z.number().finite().nonnegative(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("satisfy_dependency"),
+      phi: nonEmptyStringSchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("coordinate_session"),
+      conflictType: z.enum(["write_write", "read_write"]),
+      resource: nonEmptyStringSchema,
+      otherSessionId: nonEmptyStringSchema,
+      mode: z.enum(["serialize_first", "branch_split_required"]).optional(),
+      outcome: z.enum(["serialize_wait", "branch_split_required"]).optional(),
+      unblock: z
+        .array(
+          z
+            .object({
+              kind: nonEmptyStringSchema,
+              detail: nonEmptyStringSchema,
+            })
+            .strict()
+        )
+        .min(1),
+    })
+    .strict(),
+]);
+
+const blockerCertificateSchema = z
+  .object({
+    blockerId: nonEmptyStringSchema,
+    blockerType: z.enum([
+      "epistemic_rejected",
+      "epistemic_tension",
+      "epistemic_evidence_gap",
+      "epistemic_deferred",
+      "session_coordination",
+    ]),
+    atoms: z.array(nonEmptyStringSchema),
+    permanent: z.boolean(),
+    sufficient: z.boolean(),
+    recommendations: z
+      .object({
+        semantics: z.literal("advisory"),
+        moves: z.array(acquisitionMoveSchema),
+      })
+      .strict(),
+    next: blockerDirectiveSchema,
+  })
+  .strict();
 
 const inputSchema = z
   .object({
@@ -300,9 +425,21 @@ const updateSessionArgsSchema = z
   })
   .strict();
 
+const suggestRepairsArgsSchema = z
+  .object({
+    blocked: z
+      .object({
+        action: actionSchema,
+        certificates: z.array(blockerCertificateSchema).min(1),
+      })
+      .strict(),
+  })
+  .strict();
+
 type StepArgs = z.infer<typeof stepArgsSchema>;
 type NewSessionArgs = z.infer<typeof newSessionArgsSchema>;
 type UpdateSessionArgs = z.infer<typeof updateSessionArgsSchema>;
+type SuggestRepairsArgs = z.infer<typeof suggestRepairsArgsSchema>;
 
 function toToolResponse(payload: Record<string, unknown>) {
   return {
@@ -560,6 +697,27 @@ export function createResidualMcpServer(options?: { sessionRootDir?: string }) {
           sessionArbitrations: result.sessionArbitrations,
         },
         softBlocked: result.softBlocked,
+      });
+    }
+  );
+
+  server.registerTool(
+    "suggest_repairs",
+    {
+      description:
+        "Compile blocked-action certificates into a deterministic repair plan without mutating session state.",
+      inputSchema: suggestRepairsArgsSchema,
+    },
+    async (args: SuggestRepairsArgs) => {
+      const repairPlan = compileRepairPlan(
+        args.blocked.certificates as BlockerCertificate[]
+      );
+      return toToolResponse({
+        action: args.blocked.action,
+        repairPlan,
+        surface: "suggest_repairs",
+        rationale:
+          "Planning-only MCP surface: strict blocker semantics are compiled into a stable repair agenda with no side effects.",
       });
     }
   );

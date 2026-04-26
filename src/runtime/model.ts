@@ -22,6 +22,33 @@ export type {
   BlockerCertificate,
 } from "./types/domain";
 export { createEmptyResidual, createInitialState, ageOf } from "./types/domain";
+export type {
+  RepairDirective,
+  RepairAdvice,
+  RepairIntent,
+  RepairPlan,
+  RepairTrace,
+  RepairTraceEntry,
+  RepairAdapterCapability,
+  RepairObservationProvenance,
+  RepairObservation,
+  RepairQueryRequest,
+  RepairRunCheckRequest,
+  RepairRequestApprovalRequest,
+  RepairObserveRequest,
+  RepairAdjudicateRequest,
+  RepairCoordinateRequest,
+  RepairAdapterRequest,
+  RepairAdapterHandlers,
+  RepairAdapter,
+  SeededFakeObservation,
+  SeededFakeAdapterScript,
+  SeededFakeAdapterOptions,
+  RepairCycleTrace,
+  RunRepairCycleFailureCode,
+  RunRepairCycleParams,
+  RunRepairCycleResult,
+} from "./types/repair";
 
 export type {
   EscalationEvent,

@@ -27,6 +27,7 @@
     "start": "npm run build && node dist/index.js",
     "test": "npm run build && NODE_ENV=test node --test \"dist/**/*.test.js\"",
     "example:failure-case": "npm run build && node dist/examples/concreteFailureCase.js",
+    "example:repair-runbook": "npm run build && node dist/examples/repairRunbook.js",
     "cli": "npm run build && node dist/cli/index.js",
     "mcp": "npm run build && node dist/mcp/server.js",
     "mcp:migrate": "npm run build && node dist/mcp/migrate.js",

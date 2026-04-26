@@ -1,3 +1,8 @@
+import {
+  DEPLOY_INITIAL_INPUT,
+  DEPLOY_INITIAL_PROPOSALS,
+  DEPLOY_TO_PRODUCTION_ACTION,
+} from "../examples/deployRepairFixtures";
 import type { Proposal, Input } from "../runtime/model";
 
 export const SYSTEM_PROMPT = `You are a junior developer who wants to deploy a service to production.
@@ -31,32 +36,6 @@ Rules:
 
 Goal: get DEPLOY_TO_PRODUCTION approved.`;
 
-export const INITIAL_PROPOSALS: Proposal[] = [
-  // CI result is disputed — someone reported tests passing, someone else reported a failure
-  {
-    kind: "tension",
-    phi1: "tests=passing",
-    phi2: "tests=failing",
-  },
-  // Security scan score not yet sufficient
-  {
-    kind: "evidence_gap",
-    phi: "security_scan",
-    threshold: 0.8,
-    escalationSteps: 5,
-  },
-  // Staging sign-off is deferred pending lead review
-  {
-    kind: "deferred",
-    constraint: { type: "Prop", phi: "staging_approved" },
-    dependencies: ["lead_review=done"],
-  },
-];
-
-export const INITIAL_INPUT: Input = {};
-
-export const DEPLOY_ACTION = {
-  kind: "action" as const,
-  type: "DEPLOY_TO_PRODUCTION",
-  dependsOn: ["tests=passing", "security_scan", "staging_approved"],
-};
+export const INITIAL_PROPOSALS: Proposal[] = DEPLOY_INITIAL_PROPOSALS;
+export const INITIAL_INPUT: Input = DEPLOY_INITIAL_INPUT;
+export const DEPLOY_ACTION = DEPLOY_TO_PRODUCTION_ACTION;

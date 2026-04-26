@@ -1,8 +1,9 @@
 // ── Core step functions ──────────────────────────────────────────────────────
 export { step, naiveStep, discharge, lift } from "./runtime/engine";
 
-// ── Predicates (action blocking logic) ──────────────────────────────────────
-export { blocks, blockingAtoms, filterBlocked, whatWouldUnblock } from "./runtime/predicates";
+// ── Predicates (action blocking logic + repair certificates) ────────────────
+export { blocks, blockingAtoms, filterBlocked, whatWouldUnblock, blockerCertificates } from "./runtime/predicates";
+export { compileRepairPlan, runRepairCycle, createSeededFakeRepairAdapter } from "./runtime/repair";
 
 // ── Policies (fingerprint, oscillation, soft-blocking, causal annotations) ──
 export { computeFingerprint, detectOscillations, computeSoftBlocked, buildCausalAnnotations } from "./runtime/policies";
@@ -55,6 +56,31 @@ export type {
   UnblockAnalysis,
   AcquisitionMove,
   BlockerCertificate,
+  RepairDirective,
+  RepairAdvice,
+  RepairIntent,
+  RepairPlan,
+  RepairTrace,
+  RepairTraceEntry,
+  RepairAdapterCapability,
+  RepairObservationProvenance,
+  RepairObservation,
+  RepairQueryRequest,
+  RepairRunCheckRequest,
+  RepairRequestApprovalRequest,
+  RepairObserveRequest,
+  RepairAdjudicateRequest,
+  RepairCoordinateRequest,
+  RepairAdapterRequest,
+  RepairAdapterHandlers,
+  RepairAdapter,
+  SeededFakeObservation,
+  SeededFakeAdapterScript,
+  SeededFakeAdapterOptions,
+  RepairCycleTrace,
+  RunRepairCycleFailureCode,
+  RunRepairCycleParams,
+  RunRepairCycleResult,
 } from "./runtime/model";
 
 // ── Event / result types ─────────────────────────────────────────────────────

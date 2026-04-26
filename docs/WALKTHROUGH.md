@@ -6,6 +6,8 @@
 
 This document is not a simplification layer. It is an **operator-semantics layer**: the same runtime, presented in the vocabulary of invariants, execution phases, and concrete traces. The repository intentionally keeps only a small active doc surface; this file is the rigorous middle layer between orientation and implementation contract.
 
+The runtime reasons over submitted signals. It does not discover the world by itself; it determines what is admissible given the blocker state that connected systems submit.
+
 ## 1. The Same System in Three Registers
 
 The project is one object described three ways:
@@ -38,7 +40,7 @@ The runtime is built around not collapsing these two things into one store.
 Operational consequence:
 
 - `state` answers: what has already been settled?
-- `residual` answers: what is still preventing legitimacy?
+- `residual` answers: what is still preventing admissibility now?
 
 ## 3. Why Blocking Depends on Both `residual` and `state`
 
@@ -68,7 +70,7 @@ The reference runtime currently follows this shape:
 5. emit(actions_approved)
 ```
 
-Each phase owns a different kind of semantic responsibility.
+Each phase owns a different kind of runtime responsibility.
 
 ### 4.1 Discharge
 
@@ -107,7 +109,7 @@ This phase is deliberately pluggable. The runtime does not insist on one interpr
 
 ### 4.4 Filter
 
-Filtering is the legitimacy check.
+Filtering is the admissibility check.
 
 This phase asks: given the newly computed state and residual, which candidate actions are admissible *now*?
 
@@ -194,7 +196,7 @@ Result:
 - `x=false` is rejected
 - the previously blocked action can now be approved
 
-This is the transition from pending blockage to ordinary legitimacy.
+This is the transition from pending blockage to ordinary admissibility.
 
 ### Step 3: Loser branch returns
 
@@ -225,6 +227,28 @@ When you run it, read it as an execution trace of the kernel contract:
 - after filtering
 
 That is the operational bridge between the code and the system contract.
+
+## 8.5 Repair Loop Trace (Deploy Runbook)
+
+The repair runbook example (`npm run example:repair-runbook`) demonstrates the bounded certificate-to-repair protocol for a blocked deploy action.
+
+Operational trace shape:
+
+1. `step` blocks `DEPLOY_TO_PRODUCTION` and emits blocker certificates.
+2. `compileRepairPlan` turns certificates into ordered `RepairIntent` items.
+3. `RepairAdapter` capabilities emit observation patches (for example evidence, adjudication, approval).
+4. `runRepairCycle` merges patches and replays the target action through `step`.
+5. The loop terminates on target approval, permanent blocker detection, missing capability, or max-cycle budget.
+
+What to read in outputs:
+
+- `cycles[n].certificates`: strict blocker semantics at cycle start
+- `cycles[n].plan`: deterministic repair intents and summary
+- `cycles[n].observations`: adapter provenance for each acquisition move
+- `cycles[n].generatedInput`: exactly what the loop submitted back to `step`
+- `cycles[n].stepResult`: approved/blocked actions after replay
+
+Boundary reminder: this protocol executes only over submitted signals. It does not autonomously choose authoritative sources; external systems must provide the evidence, adjudications, and approvals.
 
 ## 9. What to Read Next
 
