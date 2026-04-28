@@ -316,3 +316,70 @@ test("CcpVerificationError: thrown by verifyCcpTrace on ask-failed-after-tell vi
   assert.ok(err instanceof Error);
   assert.ok(err.message.includes("budget"));
 });
+
+test("replayLog: strict attestation mode throws on policyVersion mismatch", () => {
+  const initialState = createInitialState();
+  const initialResidual = createEmptyResidual();
+  const log = createInMemoryLog();
+  const action = { kind: "action" as const, type: "PAY", dependsOn: ["approved"] };
+
+  const first = step({
+    state: initialState,
+    residual: initialResidual,
+    input: { evidence: { approved: 0.99 } },
+    proposals: [action],
+  });
+
+  const tampered = {
+    ...first.replay,
+    attestation: {
+      ...(first.replay.attestation ?? {
+        runtimeVersion: "0.1.0",
+        schemaVersion: "replay.v2",
+        policyVersion: "policy.v1",
+      }),
+      policyVersion: "policy.v2",
+    },
+  };
+  appendStep(log, tampered);
+
+  assert.throws(
+    () =>
+      replayLog(log, initialState, initialResidual, [[action]], {
+        attestationMode: "strict",
+      }),
+    (error: unknown) => error instanceof ReplayMismatchError
+  );
+});
+
+test("replayLog: compatible attestation mode tolerates policyVersion mismatch", () => {
+  const initialState = createInitialState();
+  const initialResidual = createEmptyResidual();
+  const log = createInMemoryLog();
+  const action = { kind: "action" as const, type: "PAY", dependsOn: ["approved"] };
+
+  const first = step({
+    state: initialState,
+    residual: initialResidual,
+    input: { evidence: { approved: 0.99 } },
+    proposals: [action],
+  });
+
+  const tampered = {
+    ...first.replay,
+    attestation: {
+      ...(first.replay.attestation ?? {
+        runtimeVersion: "0.1.0",
+        schemaVersion: "replay.v2",
+        policyVersion: "policy.v1",
+      }),
+      policyVersion: "policy.v9",
+    },
+  };
+  appendStep(log, tampered);
+
+  const replayed = replayLog(log, initialState, initialResidual, [[action]], {
+    attestationMode: "compatible",
+  });
+  assert.equal(replayed.length, 1);
+});

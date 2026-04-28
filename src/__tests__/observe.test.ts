@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { step } from "../runtime/engine";
 import { createEmptyResidual, createInitialState } from "../runtime/model";
-import { diffStep, computeMetrics, summarizeTrace } from "../runtime/observe";
+import { diffStep, computeMetrics, summarizeTrace, buildAssuranceBundle } from "../runtime/observe";
 
 function buildFailureCaseEvents() {
   const actionA = { kind: "action" as const, type: "USE_X_TRUE", dependsOn: ["x=true"] };
@@ -111,4 +111,18 @@ test("summarizeTrace: includes CCP₀ verification status", () => {
   const events = buildFailureCaseEvents();
   const summary = summarizeTrace(events);
   assert.ok(summary.includes("CCP₀ verification: PASS"), `expected PASS line, got: ${summary}`);
+});
+
+test("buildAssuranceBundle: exports deterministic assurance package shape", () => {
+  const events = buildFailureCaseEvents();
+  const bundle = buildAssuranceBundle(events);
+
+  assert.equal(bundle.bundleVersion, "assurance.v1");
+  assert.equal(bundle.metrics.totalSteps, 3);
+  assert.equal(bundle.attestation.totalSteps, 3);
+  assert.equal(bundle.attestation.withAttestation, 3);
+  assert.ok(bundle.decision.combinedDecisionHash.length > 0);
+  assert.equal(bundle.decision.decisionHashes.length, 3);
+  assert.equal(bundle.ccp.valid, true);
+  assert.ok(bundle.blockers.blockedActions >= 1);
 });

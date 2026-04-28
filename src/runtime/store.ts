@@ -1,5 +1,14 @@
 import { step } from "./engine";
-import type { Action, Input, Proposal, Residual, ReplayEvent, State, StepResult } from "./model";
+import type {
+  Action,
+  Input,
+  Proposal,
+  ReplayAttestation,
+  Residual,
+  ReplayEvent,
+  State,
+  StepResult,
+} from "./model";
 import { translateTrace, verifyCcpTrace } from "./verify/ccp0";
 
 export interface StepLogAdapter {
@@ -46,6 +55,8 @@ export class CcpVerificationError extends Error {
 function actionKey(a: Action): string {
   return JSON.stringify({
     type: a.type,
+    operationId: a.operationId?.trim() || undefined,
+    riskTier: a.riskTier ?? "medium",
     dependsOn: (a.dependsOn ?? []).slice().sort(),
     readSet: (a.readSet ?? []).slice().sort(),
     writeSet: (a.writeSet ?? []).slice().sort(),
@@ -61,7 +72,13 @@ export function replayLog(
   initialState: State,
   initialResidual: Residual,
   proposalSets: Proposal[][],
-  options?: { ccpVerify?: boolean; stateVerify?: boolean }
+  options?: {
+    ccpVerify?: boolean;
+    stateVerify?: boolean;
+    decisionVerify?: boolean;
+    attestationMode?: "strict" | "compatible";
+    expectedAttestation?: Partial<ReplayAttestation>;
+  }
 ): StepResult[] {
   const events = log.readAll();
   if (events.length !== proposalSets.length) {
@@ -73,6 +90,8 @@ export function replayLog(
   const results: StepResult[] = [];
   let state = initialState;
   let residual = initialResidual;
+
+  const attestationMode = options?.attestationMode ?? "strict";
 
   for (let i = 0; i < events.length; i++) {
     const stored = events[i];
@@ -92,6 +111,23 @@ export function replayLog(
     if (JSON.stringify(expectedBlocked) !== JSON.stringify(actualBlocked)) {
       throw new ReplayMismatchError(i, "actionsBlocked", expectedBlocked, actualBlocked);
     }
+
+    if (options?.decisionVerify) {
+      if (!stored.decisionHash) {
+        throw new ReplayMismatchError(i, "decisionHash", "present", undefined);
+      }
+      if (stored.decisionHash !== result.decisionHash) {
+        throw new ReplayMismatchError(i, "decisionHash", stored.decisionHash, result.decisionHash);
+      }
+    }
+
+    verifyAttestation({
+      stepIndex: i,
+      mode: attestationMode,
+      expected: options?.expectedAttestation,
+      stored: stored.attestation,
+      actual: result.attestation,
+    });
 
     if (options?.stateVerify) {
       const snap = stored.after.state;
@@ -143,4 +179,64 @@ export function replayLog(
   }
 
   return results;
+}
+
+function semverMajor(version: string): string {
+  return version.split(".")[0] ?? version;
+}
+
+function verifyAttestation(params: {
+  stepIndex: number;
+  mode: "strict" | "compatible";
+  expected?: Partial<ReplayAttestation>;
+  stored?: ReplayAttestation;
+  actual?: ReplayAttestation;
+}): void {
+  const { stepIndex, mode, expected, stored, actual } = params;
+  if (!stored || !actual) {
+    if (mode === "strict") {
+      throw new ReplayMismatchError(stepIndex, "attestation", stored, actual);
+    }
+    return;
+  }
+
+  if (mode === "strict") {
+    if (JSON.stringify(stored) !== JSON.stringify(actual)) {
+      throw new ReplayMismatchError(stepIndex, "attestation", stored, actual);
+    }
+    if (expected) {
+      const expectedMerged = { ...stored, ...expected };
+      if (JSON.stringify(expectedMerged) !== JSON.stringify(stored)) {
+        throw new ReplayMismatchError(stepIndex, "attestation.expected", expected, stored);
+      }
+    }
+    return;
+  }
+
+  if (semverMajor(stored.runtimeVersion) !== semverMajor(actual.runtimeVersion)) {
+    throw new ReplayMismatchError(
+      stepIndex,
+      "attestation.runtimeVersion.major",
+      semverMajor(stored.runtimeVersion),
+      semverMajor(actual.runtimeVersion)
+    );
+  }
+
+  if (stored.schemaVersion !== actual.schemaVersion) {
+    throw new ReplayMismatchError(
+      stepIndex,
+      "attestation.schemaVersion",
+      stored.schemaVersion,
+      actual.schemaVersion
+    );
+  }
+
+  if (expected?.schemaVersion !== undefined && expected.schemaVersion !== stored.schemaVersion) {
+    throw new ReplayMismatchError(
+      stepIndex,
+      "attestation.expected.schemaVersion",
+      expected.schemaVersion,
+      stored.schemaVersion
+    );
+  }
 }

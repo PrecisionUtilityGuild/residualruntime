@@ -183,3 +183,106 @@ test("custom TransitionEngine: injected engine controls candidate actions", () =
   assert.equal(result.actionsApproved[0].type, "FIXED_ACTION");
   assert.ok(!result.actionsApproved.some((a) => a.type === "IGNORED_ACTION"));
 });
+
+test("step emits deterministic decisionHash for equivalent executions", () => {
+  const input = {
+    constraints: [{ type: "Unresolved" as const, phi1: "x=true", phi2: "x=false" }],
+  };
+  const proposals = [
+    { kind: "action" as const, type: "USE_X_TRUE", dependsOn: ["x=true"] },
+    { kind: "action" as const, type: "USE_X_FALSE", dependsOn: ["x=false"] },
+  ];
+
+  const runA = step({
+    state: createInitialState(),
+    residual: createEmptyResidual(),
+    input,
+    proposals,
+  });
+  const runB = step({
+    state: createInitialState(),
+    residual: createEmptyResidual(),
+    input,
+    proposals,
+  });
+
+  assert.equal(runA.decisionHash, runB.decisionHash);
+  assert.equal(runA.decisionHash, runA.replay.decisionHash);
+  assert.deepEqual(
+    runA.actionsBlocked.map((action) => action.type),
+    ["USE_X_FALSE", "USE_X_TRUE"],
+    "actionsBlocked should be canonically ordered"
+  );
+});
+
+test("replayLog decisionVerify validates decisionHash identity", () => {
+  const actionA = { kind: "action" as const, type: "USE_X_TRUE", dependsOn: ["x=true"] };
+  const tension = { type: "Unresolved" as const, phi1: "x=true", phi2: "x=false" };
+
+  const log = createInMemoryLog();
+  const first = step({
+    state: createInitialState(),
+    residual: createEmptyResidual(),
+    input: { constraints: [tension] },
+    proposals: [actionA],
+  });
+  appendStep(log, first.replay);
+
+  const replayed = replayLog(
+    log,
+    createInitialState(),
+    createEmptyResidual(),
+    [[actionA]],
+    { decisionVerify: true }
+  );
+
+  assert.equal(replayed.length, 1);
+  assert.equal(replayed[0].decisionHash, first.decisionHash);
+});
+
+test("step idempotency gate ignores duplicate operationId and blocks conflicting reuse", () => {
+  const duplicate = step({
+    state: createInitialState(),
+    residual: createEmptyResidual(),
+    input: {},
+    proposals: [
+      {
+        kind: "action" as const,
+        type: "DEPLOY",
+        operationId: "op-1",
+      },
+      {
+        kind: "action" as const,
+        type: "DEPLOY",
+        operationId: "op-1",
+      },
+    ],
+  });
+  assert.equal(duplicate.actionsApproved.length, 1);
+  assert.equal(duplicate.actionsBlocked.length, 0);
+  assert.equal(duplicate.idempotencyEvents.length, 1);
+  assert.equal(duplicate.idempotencyEvents[0].outcome, "duplicate_approved_ignored");
+
+  const conflict = step({
+    state: createInitialState(),
+    residual: createEmptyResidual(),
+    input: {},
+    proposals: [
+      {
+        kind: "action" as const,
+        type: "DEPLOY",
+        operationId: "op-1",
+      },
+      {
+        kind: "action" as const,
+        type: "DEPLOY",
+        operationId: "op-1",
+        revocable: true,
+      },
+    ],
+  });
+  assert.equal(conflict.actionsApproved.length, 1);
+  assert.equal(conflict.actionsBlocked.length, 1);
+  assert.equal(conflict.idempotencyEvents.length, 1);
+  assert.equal(conflict.idempotencyEvents[0].outcome, "operation_conflict_blocked");
+});

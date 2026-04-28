@@ -208,3 +208,29 @@ test("domain-fit manufacturing safety: adjudicated losing branch remains permane
   assert.equal(unblock.permanent, true, "manufacturing start action should be permanently foreclosed on rejected atom");
   assert.deepEqual(unblock.deltas, []);
 });
+
+test("domain-fit risk tier: blocked high-risk action emits deterministic risk escalation", () => {
+  const highRiskDeploy = {
+    kind: "action" as const,
+    type: "DEPLOY_TO_PRODUCTION",
+    riskTier: "high" as const,
+    dependsOn: ["security_scan_ok"],
+  };
+
+  const blocked = step({
+    state: createInitialState(),
+    residual: createEmptyResidual(),
+    input: {
+      constraints: [{ type: "RequireEvidence", phi: "security_scan_ok", threshold: 0.95 }],
+      evidence: { security_scan_ok: 0.6 },
+    },
+    proposals: [highRiskDeploy],
+  });
+
+  assert.equal(blocked.actionsApproved.length, 0);
+  assert.equal(blocked.actionsBlocked.length, 1);
+  assert.equal(blocked.riskEscalations.length, 1);
+  assert.equal(blocked.riskEscalations[0].tier, "high");
+  assert.equal(blocked.riskEscalations[0].requiredHumanReview, true);
+  assert.equal(blocked.riskEscalations[0].reason, "blocked_high_risk_action");
+});

@@ -1,4 +1,6 @@
 import { dischargeAll } from "./discharge";
+import { createHash } from "node:crypto";
+import { DEFAULT_POLICY_VERSION, REPLAY_SCHEMA_VERSION, RUNTIME_VERSION } from "./version";
 import { pruneMaterializedDeferred } from "./deferredState";
 import { contractBelief } from "./discharge/tensions";
 import { mergeConstraints } from "./constraints";
@@ -14,6 +16,7 @@ import {
   type EscalationEvent,
   type EvidenceGap,
   type InvalidAdjudicationEvent,
+  type IdempotencyEvent,
   type Input,
   type Proposal,
   type ReopenAppliedEvent,
@@ -22,6 +25,8 @@ import {
   type Residual,
   type ResidualLimits,
   type SessionArbitrationPolicy,
+  type RiskEscalationEvent,
+  type RiskTier,
   type State,
   type StepResult,
   type TensionTimeoutPolicy,
@@ -31,12 +36,176 @@ function deepClone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
+function stableSerialize(value: unknown): string {
+  if (value === null || value === undefined) return JSON.stringify(value);
+  if (typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((item) => stableSerialize(item)).join(",")}]`;
+
+  const objectValue = value as Record<string, unknown>;
+  const keys = Object.keys(objectValue).sort();
+  const entries = keys.map((key) => `${JSON.stringify(key)}:${stableSerialize(objectValue[key])}`);
+  return `{${entries.join(",")}}`;
+}
+
+function hashDecision(payload: unknown): string {
+  const stripped = stripVolatileForHash(payload);
+  return createHash("sha256").update(stableSerialize(stripped)).digest("hex");
+}
+
+function stripVolatileForHash(value: unknown): unknown {
+  if (value === null || value === undefined) return value;
+  if (typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map((item) => stripVolatileForHash(item));
+
+  const objectValue = value as Record<string, unknown>;
+  const normalized: Record<string, unknown> = {};
+  for (const [key, inner] of Object.entries(objectValue)) {
+    if (key === "createdAt") continue;
+    normalized[key] = stripVolatileForHash(inner);
+  }
+  return normalized;
+}
+
+function actionOrderKey(action: Action): string {
+  return stableSerialize({
+    type: action.type,
+    operationId: action.operationId,
+    riskTier: action.riskTier ?? "medium",
+    dependsOn: (action.dependsOn ?? []).slice().sort(),
+    readSet: (action.readSet ?? []).slice().sort(),
+    writeSet: (action.writeSet ?? []).slice().sort(),
+    revocable: action.revocable === true,
+  });
+}
+
+function actionOperationFingerprint(action: Action): string {
+  return stableSerialize({
+    type: action.type,
+    riskTier: action.riskTier ?? "medium",
+    dependsOn: (action.dependsOn ?? []).slice().sort(),
+    readSet: (action.readSet ?? []).slice().sort(),
+    writeSet: (action.writeSet ?? []).slice().sort(),
+    revocable: action.revocable === true,
+  });
+}
+
+function applyIdempotencyGate(params: {
+  approvedActions: Action[];
+  blockedActions: Action[];
+  priorFingerprints?: Record<string, string>;
+}): {
+  approvedActions: Action[];
+  blockedActions: Action[];
+  blockedByMarkers: string[];
+  idempotencyEvents: IdempotencyEvent[];
+} {
+  const approved: Action[] = [];
+  const blocked = [...params.blockedActions];
+  const blockedByMarkers: string[] = [];
+  const idempotencyEvents: IdempotencyEvent[] = [];
+  const knownFingerprints = { ...(params.priorFingerprints ?? {}) };
+
+  for (const action of params.approvedActions) {
+    const operationId = action.operationId?.trim();
+    if (!operationId) {
+      approved.push(action);
+      continue;
+    }
+
+    const fingerprint = actionOperationFingerprint(action);
+    const prior = knownFingerprints[operationId];
+    if (prior === undefined) {
+      knownFingerprints[operationId] = fingerprint;
+      approved.push(action);
+      continue;
+    }
+
+    if (prior === fingerprint) {
+      idempotencyEvents.push({
+        kind: "idempotency",
+        operationId,
+        action,
+        outcome: "duplicate_approved_ignored",
+        reason: `Operation "${operationId}" already executed with identical fingerprint; duplicate approval ignored.`,
+      });
+      continue;
+    }
+
+    blocked.push(action);
+    blockedByMarkers.push(`idempotency:operation_conflict_blocked:${operationId}`);
+    idempotencyEvents.push({
+      kind: "idempotency",
+      operationId,
+      action,
+      outcome: "operation_conflict_blocked",
+      reason: `Operation "${operationId}" re-used with a different fingerprint; action blocked to preserve idempotency contract.`,
+    });
+  }
+
+  return {
+    approvedActions: sortActions(approved),
+    blockedActions: sortActions(blocked),
+    blockedByMarkers: blockedByMarkers.sort(),
+    idempotencyEvents: [...idempotencyEvents].sort((left, right) =>
+      stableSerialize(left).localeCompare(stableSerialize(right))
+    ),
+  };
+}
+
+function resolveRiskTier(action: Action): RiskTier {
+  return action.riskTier ?? "medium";
+}
+
+function buildRiskEscalations(blocked: Action[]): RiskEscalationEvent[] {
+  return blocked
+    .filter((action) => {
+      const tier = resolveRiskTier(action);
+      return tier === "high" || tier === "critical";
+    })
+    .map((action) => ({
+      kind: "risk_escalation" as const,
+      action,
+      tier: resolveRiskTier(action),
+      reason: "blocked_high_risk_action" as const,
+      requiredHumanReview: true as const,
+    }))
+    .sort((left, right) => stableSerialize(left).localeCompare(stableSerialize(right)));
+}
+
+function sortActions(actions: Action[]): Action[] {
+  return [...actions].sort((left, right) => actionOrderKey(left).localeCompare(actionOrderKey(right)));
+}
+
+function constraintOrderKey(constraint: Constraint): string {
+  return stableSerialize(constraint);
+}
+
+function sortConstraints(constraints: Constraint[]): Constraint[] {
+  return [...constraints].sort((left, right) =>
+    constraintOrderKey(left).localeCompare(constraintOrderKey(right))
+  );
+}
+
+function sortEscalations(escalations: EscalationEvent[]): EscalationEvent[] {
+  return [...escalations].sort((left, right) => {
+    if (left.phi !== right.phi) return left.phi.localeCompare(right.phi);
+    if (left.threshold !== right.threshold) return left.threshold - right.threshold;
+    return left.stepsWithoutEvidence - right.stepsWithoutEvidence;
+  });
+}
+
 const NOOP_SESSION_ARBITRATION_POLICY: SessionArbitrationPolicy = {
   enabled: false,
   defaultMode: "serialize_first",
   modeByConflictType: {},
   objectiveTypePriority: {},
 };
+
+const DEFAULT_REPLAY_ATTESTATION = {
+  runtimeVersion: RUNTIME_VERSION,
+  schemaVersion: REPLAY_SCHEMA_VERSION,
+  policyVersion: DEFAULT_POLICY_VERSION,
+} as const;
 
 // Shallow-freeze in test/dev mode so callers discover accidental mutation early.
 // Production skips the freeze to avoid the overhead.
@@ -231,22 +400,42 @@ export function naiveStep(params: {
   const beforeResidual = deepClone(residual);
 
   const { residualPre, statePre, escalatedGaps, invalidAdjudications } = discharge(residual, state, input);
-  const constraints = mergeConstraints(input.constraints ?? [], lift(residualPre));
+  const constraints = sortConstraints(mergeConstraints(input.constraints ?? [], lift(residualPre)));
   const { stateNext, actionsCandidate, residualNew } = engine.run(statePre, constraints, proposals, residualPre);
   pruneMaterializedDeferred(residualNew, stateNext);
-  const escalations: EscalationEvent[] = escalatedGaps.map((g) => ({
+  const escalations: EscalationEvent[] = sortEscalations(escalatedGaps.map((g) => ({
     kind: "escalation",
     phi: g.phi,
     stepsWithoutEvidence: g.stepsWithoutEvidence ?? 0,
     threshold: g.threshold,
-  }));
+  })));
+  const candidateActionsSorted = sortActions(actionsCandidate);
+  const approvedActionsSorted = candidateActionsSorted;
+  const invalidAdjudicationsSorted = [...invalidAdjudications]
+    .sort((left, right) => stableSerialize(left).localeCompare(stableSerialize(right)));
+  const emittedRevocableSorted = sortActions(
+    approvedActionsSorted.filter((a) => a.revocable === true)
+  );
+  const decisionHash = hashDecision({
+    input,
+    constraints,
+    candidateActions: candidateActionsSorted,
+    approvedActions: approvedActionsSorted,
+    blockedActions: [],
+    stateNext,
+    residualNext: residualNew,
+    escalations,
+    invalidAdjudications: invalidAdjudicationsSorted,
+  });
 
   return {
+    decisionHash,
+    attestation: DEFAULT_REPLAY_ATTESTATION,
     stateNext: freezeIfTest(stateNext),
     residualNext: freezeIfTest(residualNew),
-    actionsApproved: actionsCandidate,
+    actionsApproved: approvedActionsSorted,
     actionsBlocked: [],
-    softBlocked: computeSoftBlocked(actionsCandidate, constraints),
+    softBlocked: computeSoftBlocked(approvedActionsSorted, constraints),
     approvedWith: [],
     blockedWith: [],
     escalations,
@@ -254,23 +443,29 @@ export function naiveStep(params: {
     oscillations: [],
     fingerprintHistory: [],
     autoAdjudications: [],
-    invalidAdjudications,
+    invalidAdjudications: invalidAdjudicationsSorted,
     reopenApplied: [],
     reopenBlocked: [],
     deadlocks: [],
     sessionArbitrationPolicy: NOOP_SESSION_ARBITRATION_POLICY,
     sessionConflicts: [],
     sessionArbitrations: [],
-    emittedRevocable: actionsCandidate.filter((a) => a.revocable === true),
+    riskEscalations: [],
+    idempotencyEvents: [],
+    emittedRevocable: emittedRevocableSorted,
     revokedActions: [],
     replay: {
+      decisionHash,
+      attestation: DEFAULT_REPLAY_ATTESTATION,
       input: deepClone(input),
       before: { state: beforeState, residual: beforeResidual },
       afterDischarge: { statePre: deepClone(statePre), residualPre: deepClone(residualPre) },
       constraints: deepClone(constraints),
-      candidateActions: deepClone(actionsCandidate),
-      approvedActions: deepClone(actionsCandidate),
+      candidateActions: deepClone(candidateActionsSorted),
+      approvedActions: deepClone(approvedActionsSorted),
       blockedActions: [],
+      riskEscalations: [],
+      idempotencyEvents: [],
       after: { state: deepClone(stateNext), residual: deepClone(residualNew) },
     },
   };
@@ -289,6 +484,7 @@ export function step(params: {
   oscillationWindowSteps?: number;
   priorRevocable?: Action[];
   nowMs?: number;
+  priorOperationFingerprints?: Record<string, string>;
 }): StepResult {
   const { state, residual, input } = params;
   const proposals = params.proposals ?? [];
@@ -346,7 +542,9 @@ export function step(params: {
     });
   }
 
-  const constraints = mergeConstraints(effectiveInput.constraints ?? [], lift(residualPre));
+  const constraints = sortConstraints(
+    mergeConstraints(effectiveInput.constraints ?? [], lift(residualPre))
+  );
   const { stateNext, actionsCandidate, residualNew } = engine.run(
     statePre,
     constraints,
@@ -354,65 +552,139 @@ export function step(params: {
     residualPre
   );
   pruneMaterializedDeferred(residualNew, stateNext);
-  const overflows = computeOverflows(residualNew, limits);
+  const overflows = [...computeOverflows(residualNew, limits)].sort((left, right) =>
+    stableSerialize(left).localeCompare(stableSerialize(right))
+  );
   const { allowed, blocked } = filterBlocked(actionsCandidate, residualNew, stateNext);
-  const escalations: EscalationEvent[] = escalatedGaps.map((g) => ({
+  const allowedSorted = sortActions(allowed);
+  const blockedSorted = sortActions(blocked);
+  const idempotencyGate = applyIdempotencyGate({
+    approvedActions: allowedSorted,
+    blockedActions: blockedSorted,
+    priorFingerprints: params.priorOperationFingerprints,
+  });
+  const approvedAfterIdempotency = idempotencyGate.approvedActions;
+  const blockedAfterIdempotency = idempotencyGate.blockedActions;
+  const escalations: EscalationEvent[] = sortEscalations(escalatedGaps.map((g) => ({
     kind: "escalation",
     phi: g.phi,
     stepsWithoutEvidence: g.stepsWithoutEvidence ?? 0,
     threshold: g.threshold,
-  }));
-  const deadlocks = computeDeadlocks(residualNew, dlThreshold);
+  })));
+  const deadlocks = [...computeDeadlocks(residualNew, dlThreshold)].sort((left, right) =>
+    stableSerialize(left).localeCompare(stableSerialize(right))
+  );
   const fingerprint = computeFingerprint(residualNew);
   const nextHistory = [...incomingHistory, fingerprint];
-  const oscillations = detectOscillations(fingerprint, incomingHistory, oscWindow);
+  const oscillations = [...detectOscillations(fingerprint, incomingHistory, oscWindow)].sort(
+    (left, right) => stableSerialize(left).localeCompare(stableSerialize(right))
+  );
 
   const { approvedWith, blockedWith } = buildCausalAnnotations(
-    allowed,
-    blocked,
+    approvedAfterIdempotency,
+    blockedAfterIdempotency,
     residualNew,
     stateNext,
     effectiveInput
   );
+  const blockedWithIdempotency = [...blockedWith];
+  for (const marker of idempotencyGate.blockedByMarkers) {
+    const operationId = marker.split(":").at(-1);
+    const action = blockedAfterIdempotency.find(
+      (candidate) => candidate.operationId?.trim() === operationId
+    );
+    if (!action) continue;
+    blockedWithIdempotency.push({
+      action,
+      blockedBy: [marker],
+      enabledBy: [],
+    });
+  }
 
-  const emittedRevocable = allowed.filter((a) => a.revocable === true);
-  const revokedActions = priorRevocable.filter((a) => blocks(residualNew, stateNext, a));
+  const emittedRevocable = sortActions(approvedAfterIdempotency.filter((a) => a.revocable === true));
+  const revokedActions = sortActions(
+    priorRevocable.filter((a) => blocks(residualNew, stateNext, a))
+  );
+  const riskEscalations = buildRiskEscalations(blockedAfterIdempotency);
+  const autoAdjudicationsSorted = [...autoAdjudications]
+    .sort((left, right) => stableSerialize(left).localeCompare(stableSerialize(right)));
+  const invalidAdjudicationsSorted = [...invalidAdjudications]
+    .sort((left, right) => stableSerialize(left).localeCompare(stableSerialize(right)));
+  const reopenAppliedSorted = [...reopenPolicy.reopenApplied].sort((left, right) =>
+    stableSerialize(left).localeCompare(stableSerialize(right))
+  );
+  const reopenBlockedSorted = [...reopenPolicy.reopenBlocked].sort((left, right) =>
+    stableSerialize(left).localeCompare(stableSerialize(right))
+  );
+  const decisionHash = hashDecision({
+    input,
+    effectiveInput,
+    constraints,
+    candidateActions: sortActions(actionsCandidate),
+    approvedActions: approvedAfterIdempotency,
+    blockedActions: blockedAfterIdempotency,
+    stateNext,
+    residualNext: residualNew,
+    escalations,
+    overflows,
+    deadlocks,
+    oscillations,
+    autoAdjudications: autoAdjudicationsSorted,
+    invalidAdjudications: invalidAdjudicationsSorted,
+    reopenApplied: reopenAppliedSorted,
+    reopenBlocked: reopenBlockedSorted,
+    idempotencyEvents: idempotencyGate.idempotencyEvents,
+    emittedRevocable,
+    revokedActions,
+  });
 
   return {
+    decisionHash,
+    attestation: DEFAULT_REPLAY_ATTESTATION,
     stateNext: freezeIfTest(stateNext),
     residualNext: freezeIfTest(residualNew),
-    actionsApproved: allowed,
-    actionsBlocked: blocked,
-    softBlocked: computeSoftBlocked(allowed, constraints),
+    actionsApproved: approvedAfterIdempotency,
+    actionsBlocked: blockedAfterIdempotency,
+    softBlocked: computeSoftBlocked(approvedAfterIdempotency, constraints),
     approvedWith,
-    blockedWith,
+    blockedWith: blockedWithIdempotency,
     escalations,
     overflows,
     oscillations,
     fingerprintHistory: nextHistory,
-    autoAdjudications,
-    invalidAdjudications,
-    reopenApplied: reopenPolicy.reopenApplied,
-    reopenBlocked: reopenPolicy.reopenBlocked,
+    autoAdjudications: autoAdjudicationsSorted,
+    invalidAdjudications: invalidAdjudicationsSorted,
+    reopenApplied: reopenAppliedSorted,
+    reopenBlocked: reopenBlockedSorted,
     deadlocks,
     sessionArbitrationPolicy: NOOP_SESSION_ARBITRATION_POLICY,
     sessionConflicts: [],
     sessionArbitrations: [],
+    riskEscalations,
+    idempotencyEvents: idempotencyGate.idempotencyEvents,
     emittedRevocable,
     revokedActions,
     replay: {
+      decisionHash,
+      attestation: DEFAULT_REPLAY_ATTESTATION,
       input: deepClone(input),
       before: { state: beforeState, residual: beforeResidual },
       afterDischarge: { statePre: deepClone(statePre), residualPre: deepClone(residualPre) },
       constraints: deepClone(constraints),
-      candidateActions: deepClone(actionsCandidate),
-      approvedActions: deepClone(allowed),
-      blockedActions: deepClone(blocked),
-      ...(reopenPolicy.reopenApplied.length > 0 || reopenPolicy.reopenBlocked.length > 0
+      candidateActions: deepClone(sortActions(actionsCandidate)),
+      approvedActions: deepClone(approvedAfterIdempotency),
+      blockedActions: deepClone(blockedAfterIdempotency),
+      ...(riskEscalations.length > 0
+        ? { riskEscalations: deepClone(riskEscalations) }
+        : {}),
+      ...(idempotencyGate.idempotencyEvents.length > 0
+        ? { idempotencyEvents: deepClone(idempotencyGate.idempotencyEvents) }
+        : {}),
+      ...(reopenAppliedSorted.length > 0 || reopenBlockedSorted.length > 0
         ? {
             reopen: {
-              applied: deepClone(reopenPolicy.reopenApplied),
-              blocked: deepClone(reopenPolicy.reopenBlocked),
+              applied: deepClone(reopenAppliedSorted),
+              blocked: deepClone(reopenBlockedSorted),
             },
           }
         : {}),

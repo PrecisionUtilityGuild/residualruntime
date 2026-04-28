@@ -278,6 +278,8 @@ test("blockerCertificates: evidence-gap certificates include advisory acquisitio
 
   assert.equal(certificates.length, 1);
   assert.equal(certificates[0].blockerType, "epistemic_evidence_gap");
+  assert.equal(certificates[0].ownership.ownerRole, "evidence_provider");
+  assert.equal(certificates[0].ownership.sla.targetMs, 45 * 60 * 1000);
   assert.equal(certificates[0].recommendations.semantics, "advisory");
   assert.ok(
     certificates[0].recommendations.moves.some((move) => move.kind === "run_check"),
@@ -309,6 +311,7 @@ test("blockerCertificates: deferred approval blockers recommend request_approval
 
   assert.equal(certificates.length, 1);
   assert.equal(certificates[0].blockerType, "epistemic_deferred");
+  assert.equal(certificates[0].ownership.ownerRole, "approver");
   assert.ok(
     certificates[0].recommendations.moves.some((move) => move.kind === "request_approval"),
     "deferred Prop dependency should recommend approval chasing"
@@ -329,6 +332,7 @@ test("blockerCertificates: tension blockers recommend query and observation move
 
   assert.equal(certificates.length, 1);
   assert.equal(certificates[0].blockerType, "epistemic_tension");
+  assert.equal(certificates[0].ownership.ownerRole, "arbiter");
   assert.ok(
     certificates[0].recommendations.moves.some((move) => move.kind === "query"),
     "tension should recommend gathering adjudication evidence"

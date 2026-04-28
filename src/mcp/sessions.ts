@@ -12,6 +12,7 @@ import {
   type EventContext,
   type Input,
   type Proposal,
+  type ReplayAttestation,
   type ReplayEvent,
   type Residual,
   type ResidualLimits,
@@ -37,6 +38,7 @@ import { readLog } from "../runtime/store";
 const SESSION_FILE_EXT = ".ndjson";
 const SESSION_METADATA_FILE_EXT = ".meta.json";
 const SESSION_DB_FILENAME = "sessions.sqlite";
+const DEFAULT_RESOURCE_CLAIM_LEASE_MS = 5 * 60 * 1000;
 
 export type StepSessionRequest = {
   input?: Input;
@@ -68,6 +70,7 @@ export type SessionSnapshot = {
   metadata: SessionMetadata;
   heldResourceClaims: Action[];
   lastEventContext?: EventContext;
+  lastReplayAttestation?: ReplayAttestation;
 };
 
 export type SessionListItem = {
@@ -76,6 +79,12 @@ export type SessionListItem = {
   metadata: SessionMetadata;
   heldResourceClaimCount: number;
   lastEventContext?: EventContext;
+  lastReplayAttestation?: ReplayAttestation;
+};
+
+export type SessionReplaySnapshot = {
+  sessionId: string;
+  events: ReplayEvent[];
 };
 
 export type LegacyImportResult = {
@@ -93,9 +102,12 @@ type SessionRecord = {
   stepCount: number;
   fingerprintHistory: string[];
   activeRevocable: Action[];
+  operationFingerprints: Record<string, string>;
   heldResourceClaims: Action[];
+  heldResourceClaimLeases: Record<string, ResourceClaimLease>;
   metadata: SessionMetadata;
   lastEventContext?: EventContext;
+  lastReplayAttestation?: ReplayAttestation;
 };
 
 type PersistedSession = {
@@ -104,21 +116,53 @@ type PersistedSession = {
   stepCount: number;
   heldResourceClaimCount: number;
   lastEventContext?: EventContext;
+  lastReplayAttestation?: ReplayAttestation;
 };
 
 type SessionEnvelope = {
   metadata: SessionMetadata;
   heldResourceClaims: Action[];
+  heldResourceClaimLeases?: Record<string, ResourceClaimLease>;
+};
+
+type ResourceClaimLease = {
+  claimId: string;
+  leaseUntil: number;
+  renewedAt: number;
+  claimVersion: number;
 };
 
 function deepClone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
+function stableSerialize(value: unknown): string {
+  if (value === null || value === undefined) return JSON.stringify(value);
+  if (typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((item) => stableSerialize(item)).join(",")}]`;
+  const objectValue = value as Record<string, unknown>;
+  const keys = Object.keys(objectValue).sort();
+  const entries = keys.map((key) => `${JSON.stringify(key)}:${stableSerialize(objectValue[key])}`);
+  return `{${entries.join(",")}}`;
+}
+
 function actionKey(action: Action): string {
   return JSON.stringify({
     kind: action.kind,
     type: action.type,
+    operationId: action.operationId?.trim() || undefined,
+    riskTier: action.riskTier ?? "medium",
+    dependsOn: (action.dependsOn ?? []).slice().sort(),
+    revocable: action.revocable === true,
+    readSet: (action.readSet ?? []).slice().sort(),
+    writeSet: (action.writeSet ?? []).slice().sort(),
+  });
+}
+
+function actionOperationFingerprint(action: Action): string {
+  return stableSerialize({
+    type: action.type,
+    riskTier: action.riskTier ?? "medium",
     dependsOn: (action.dependsOn ?? []).slice().sort(),
     revocable: action.revocable === true,
     readSet: (action.readSet ?? []).slice().sort(),
@@ -130,6 +174,22 @@ function isAction(value: unknown): value is Action {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Record<string, unknown>;
   if (candidate.kind !== "action" || typeof candidate.type !== "string") {
+    return false;
+  }
+  if (
+    candidate.operationId !== undefined &&
+    (typeof candidate.operationId !== "string" || candidate.operationId.trim().length === 0)
+  ) {
+    return false;
+  }
+
+  if (
+    candidate.riskTier !== undefined &&
+    candidate.riskTier !== "low" &&
+    candidate.riskTier !== "medium" &&
+    candidate.riskTier !== "high" &&
+    candidate.riskTier !== "critical"
+  ) {
     return false;
   }
 
@@ -177,6 +237,73 @@ function mergeHeldResourceClaims(current: Action[], approved: Action[]): Action[
   return next;
 }
 
+function parsePositiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return parsed;
+}
+
+function nextClaimLease(
+  current: Record<string, ResourceClaimLease>,
+  action: Action,
+  nowMs: number,
+  leaseMs: number
+): ResourceClaimLease {
+  const key = actionKey(action);
+  const previous = current[key];
+  return {
+    claimId: previous?.claimId ?? randomUUID(),
+    leaseUntil: nowMs + leaseMs,
+    renewedAt: nowMs,
+    claimVersion: (previous?.claimVersion ?? 0) + 1,
+  };
+}
+
+function pruneExpiredClaims(
+  claims: Action[],
+  leases: Record<string, ResourceClaimLease>,
+  nowMs: number
+): { claims: Action[]; leases: Record<string, ResourceClaimLease> } {
+  const nextClaims: Action[] = [];
+  const nextLeases: Record<string, ResourceClaimLease> = {};
+  for (const claim of claims) {
+    const key = actionKey(claim);
+    const lease = leases[key];
+    if (!lease) continue;
+    if (lease.leaseUntil < nowMs) continue;
+    nextClaims.push(claim);
+    nextLeases[key] = lease;
+  }
+  return { claims: nextClaims, leases: nextLeases };
+}
+
+function mergeClaimState(params: {
+  currentClaims: Action[];
+  currentLeases: Record<string, ResourceClaimLease>;
+  approvedActions: Action[];
+  nowMs: number;
+  leaseMs: number;
+}): { claims: Action[]; leases: Record<string, ResourceClaimLease> } {
+  const seeded = pruneExpiredClaims(
+    params.currentClaims,
+    params.currentLeases,
+    params.nowMs
+  );
+  const nextClaims = mergeHeldResourceClaims(seeded.claims, params.approvedActions);
+  const nextLeases: Record<string, ResourceClaimLease> = {};
+  for (const claim of nextClaims) {
+    nextLeases[actionKey(claim)] = nextClaimLease(
+      { ...seeded.leases, ...nextLeases },
+      claim,
+      params.nowMs,
+      params.leaseMs
+    );
+  }
+  return { claims: nextClaims, leases: nextLeases };
+}
+
 function normalizeResourceSet(values?: string[]): string[] {
   if (!values || values.length === 0) return [];
   const normalized = values
@@ -216,6 +343,7 @@ type ScopedPeerAction = {
   action: Action;
   scope: SessionConflictScope;
   metadata: SessionMetadata;
+  lease: ResourceClaimLease;
 };
 
 function sessionConflictKey(conflict: {
@@ -332,6 +460,11 @@ function parseSessionEnvelope(raw: unknown): SessionEnvelope | undefined {
     return {
       metadata,
       heldResourceClaims: parseHeldResourceClaims(candidate.heldResourceClaims),
+      heldResourceClaimLeases:
+        typeof candidate.heldResourceClaimLeases === "object" &&
+        candidate.heldResourceClaimLeases !== null
+          ? (candidate.heldResourceClaimLeases as Record<string, ResourceClaimLease>)
+          : {},
     };
   }
 
@@ -340,6 +473,7 @@ function parseSessionEnvelope(raw: unknown): SessionEnvelope | undefined {
   return {
     metadata,
     heldResourceClaims: [],
+    heldResourceClaimLeases: {},
   };
 }
 
@@ -347,6 +481,7 @@ function serializeSessionEnvelope(envelope: SessionEnvelope): string {
   return JSON.stringify({
     metadata: envelope.metadata,
     heldResourceClaims: envelope.heldResourceClaims,
+    heldResourceClaimLeases: envelope.heldResourceClaimLeases ?? {},
   });
 }
 
@@ -517,7 +652,11 @@ class SessionSqliteStore {
       )
       .run(
         sessionId,
-        serializeSessionEnvelope({ metadata, heldResourceClaims: [] }),
+        serializeSessionEnvelope({
+          metadata,
+          heldResourceClaims: [],
+          heldResourceClaimLeases: {},
+        }),
         nowMs,
         nowMs
       );
@@ -567,7 +706,8 @@ class SessionSqliteStore {
     stepIndex: number,
     event: ReplayEvent,
     metadata: SessionMetadata,
-    heldResourceClaims: Action[]
+    heldResourceClaims: Action[],
+    heldResourceClaimLeases: Record<string, ResourceClaimLease>
   ): void {
     const nowMs = Date.now();
     this.db.exec("BEGIN IMMEDIATE;");
@@ -584,7 +724,11 @@ class SessionSqliteStore {
           "UPDATE sessions SET metadata_json = ?, updated_at = ? WHERE session_id = ?"
         )
         .run(
-          serializeSessionEnvelope({ metadata, heldResourceClaims }),
+          serializeSessionEnvelope({
+            metadata,
+            heldResourceClaims,
+            heldResourceClaimLeases,
+          }),
           nowMs,
           sessionId
         );
@@ -599,7 +743,8 @@ class SessionSqliteStore {
   updateSession(
     sessionId: string,
     metadata: SessionMetadata,
-    heldResourceClaims: Action[]
+    heldResourceClaims: Action[],
+    heldResourceClaimLeases: Record<string, ResourceClaimLease>
   ): void {
     const nowMs = Date.now();
     this.db
@@ -607,7 +752,11 @@ class SessionSqliteStore {
         "UPDATE sessions SET metadata_json = ?, updated_at = ? WHERE session_id = ?"
       )
       .run(
-        serializeSessionEnvelope({ metadata, heldResourceClaims }),
+        serializeSessionEnvelope({
+          metadata,
+          heldResourceClaims,
+          heldResourceClaimLeases,
+        }),
         nowMs,
         sessionId
       );
@@ -651,12 +800,15 @@ class SessionSqliteStore {
       }
 
       let lastEventContext: EventContext | undefined = undefined;
+      let lastReplayAttestation: ReplayAttestation | undefined = undefined;
       if (row.last_event_json) {
         try {
           const event = JSON.parse(row.last_event_json) as ReplayEvent;
           lastEventContext = parseEventContext(event.context);
+          lastReplayAttestation = event.attestation;
         } catch {
           lastEventContext = undefined;
+          lastReplayAttestation = undefined;
         }
       }
 
@@ -666,6 +818,7 @@ class SessionSqliteStore {
         stepCount: Number(row.step_count),
         heldResourceClaimCount: envelope.heldResourceClaims.length,
         lastEventContext,
+        lastReplayAttestation,
       };
     });
   }
@@ -740,11 +893,16 @@ export class SessionManager {
   private readonly store: SessionSqliteStore;
   private readonly sessions = new Map<string, SessionRecord>();
   private readonly defaultArbitrationPolicy: SessionArbitrationPolicy;
+  private readonly claimLeaseMs: number;
 
   constructor(rootDir?: string) {
     this.rootDir = resolveSessionRootDir(rootDir);
     this.store = new SessionSqliteStore(this.rootDir);
     this.defaultArbitrationPolicy = resolveSessionArbitrationPolicy();
+    this.claimLeaseMs = parsePositiveIntEnv(
+      "RESIDUAL_SESSION_CLAIM_LEASE_MS",
+      DEFAULT_RESOURCE_CLAIM_LEASE_MS
+    );
   }
 
   private resolveArbitrationPolicy(
@@ -777,6 +935,7 @@ export class SessionManager {
       this.store.getSessionEnvelope(sessionId) ?? {
         metadata: normalizeSessionMetadata(),
         heldResourceClaims: [],
+        heldResourceClaimLeases: {},
       };
     const metadata = envelope.metadata;
     const events = this.store.readSessionEvents(sessionId);
@@ -785,16 +944,32 @@ export class SessionManager {
     let residual = createEmptyResidual();
     let fingerprintHistory: string[] = [];
     let activeRevocable: Action[] = [];
-    const heldResourceClaims = deepClone(envelope.heldResourceClaims);
+    const operationFingerprints: Record<string, string> = {};
+    const prunedClaims = pruneExpiredClaims(
+      deepClone(envelope.heldResourceClaims),
+      deepClone(envelope.heldResourceClaimLeases ?? {}),
+      Date.now()
+    );
+    const heldResourceClaims = prunedClaims.claims;
+    const heldResourceClaimLeases = prunedClaims.leases;
     let lastEventContext: EventContext | undefined = undefined;
+    let lastReplayAttestation: ReplayAttestation | undefined = undefined;
 
     for (const event of events) {
       state = deepClone(event.after.state);
       residual = deepClone(event.after.residual);
       fingerprintHistory = [...fingerprintHistory, computeFingerprint(residual)];
       activeRevocable = reconcileRevocableActions(activeRevocable, event.approvedActions, residual, state);
+      for (const action of event.approvedActions) {
+        const operationId = action.operationId?.trim();
+        if (!operationId) continue;
+        operationFingerprints[operationId] = actionOperationFingerprint(action);
+      }
       if (event.context) {
         lastEventContext = deepClone(event.context);
+      }
+      if (event.attestation) {
+        lastReplayAttestation = deepClone(event.attestation);
       }
     }
 
@@ -805,9 +980,12 @@ export class SessionManager {
       stepCount: events.length,
       fingerprintHistory,
       activeRevocable,
+      operationFingerprints,
       heldResourceClaims,
+      heldResourceClaimLeases,
       metadata,
       lastEventContext,
+      lastReplayAttestation,
     };
 
     this.sessions.set(sessionId, session);
@@ -837,9 +1015,12 @@ export class SessionManager {
       stepCount: 0,
       fingerprintHistory: [],
       activeRevocable: [],
+      operationFingerprints: {},
       heldResourceClaims: [],
+      heldResourceClaimLeases: {},
       metadata,
       lastEventContext: undefined,
+      lastReplayAttestation: undefined,
     };
 
     this.sessions.set(sessionId, record);
@@ -862,7 +1043,8 @@ export class SessionManager {
 
   private listScopedPeerActions(
     sessionId: string,
-    context?: EventContext
+    context?: EventContext,
+    nowMs: number = Date.now()
   ): ScopedPeerAction[] {
     if (!context) return [];
 
@@ -878,7 +1060,16 @@ export class SessionManager {
       const scope = resolveSharedScope(context, loaded.lastEventContext);
       if (!scope) continue;
 
+      const pruned = pruneExpiredClaims(
+        loaded.heldResourceClaims,
+        loaded.heldResourceClaimLeases,
+        nowMs
+      );
+      loaded.heldResourceClaims = pruned.claims;
+      loaded.heldResourceClaimLeases = pruned.leases;
       for (const action of loaded.heldResourceClaims) {
+        const lease = loaded.heldResourceClaimLeases[actionKey(action)];
+        if (!lease) continue;
         const readSet = normalizeResourceSet(action.readSet);
         const writeSet = normalizeResourceSet(action.writeSet);
         if (readSet.length === 0 && writeSet.length === 0) continue;
@@ -887,6 +1078,7 @@ export class SessionManager {
           action: deepClone(action),
           scope: deepClone(scope),
           metadata: deepClone(loaded.metadata),
+          lease: deepClone(lease),
         });
       }
     }
@@ -901,7 +1093,8 @@ export class SessionManager {
 
   private detectConflictsForAction(
     action: Action,
-    scopedPeers: ScopedPeerAction[]
+    scopedPeers: ScopedPeerAction[],
+    nowMs: number
   ): SessionConflictEvent[] {
     const readSet = toResourceSet(action.readSet);
     const writeSet = toResourceSet(action.writeSet);
@@ -954,7 +1147,7 @@ export class SessionManager {
           peer,
           "write_write",
           resource,
-          `Action "${action.type}" writes "${resource}" while session "${peer.sessionId}" action "${peer.action.type}" also writes it.`
+          `Action "${action.type}" writes "${resource}" while session "${peer.sessionId}" action "${peer.action.type}" also writes it. Lease expires in ${Math.max(0, peer.lease.leaseUntil - nowMs)}ms.`
         );
       }
 
@@ -963,7 +1156,7 @@ export class SessionManager {
           peer,
           "read_write",
           resource,
-          `Action "${action.type}" writes "${resource}" while session "${peer.sessionId}" action "${peer.action.type}" reads it.`
+          `Action "${action.type}" writes "${resource}" while session "${peer.sessionId}" action "${peer.action.type}" reads it. Lease expires in ${Math.max(0, peer.lease.leaseUntil - nowMs)}ms.`
         );
       }
 
@@ -972,7 +1165,7 @@ export class SessionManager {
           peer,
           "read_write",
           resource,
-          `Action "${action.type}" reads "${resource}" while session "${peer.sessionId}" action "${peer.action.type}" writes it.`
+          `Action "${action.type}" reads "${resource}" while session "${peer.sessionId}" action "${peer.action.type}" writes it. Lease expires in ${Math.max(0, peer.lease.leaseUntil - nowMs)}ms.`
         );
       }
     }
@@ -993,7 +1186,8 @@ export class SessionManager {
     sessionMetadata: SessionMetadata,
     context: EventContext | undefined,
     actionsApproved: Action[],
-    arbitrationPolicyInput?: SessionArbitrationPolicyInput
+    arbitrationPolicyInput?: SessionArbitrationPolicyInput,
+    nowMs: number = Date.now()
   ): {
     approvedActions: Action[];
     blockedActions: Action[];
@@ -1004,7 +1198,7 @@ export class SessionManager {
   } {
     const sessionArbitrationPolicy =
       this.resolveArbitrationPolicy(arbitrationPolicyInput);
-    const scopedPeers = this.listScopedPeerActions(sessionId, context);
+    const scopedPeers = this.listScopedPeerActions(sessionId, context, nowMs);
     if (!sessionArbitrationPolicy.enabled) {
       return {
         approvedActions: deepClone(actionsApproved),
@@ -1038,7 +1232,7 @@ export class SessionManager {
     }
 
     for (const action of actionsApproved) {
-      const conflicts = this.detectConflictsForAction(action, scopedPeers);
+      const conflicts = this.detectConflictsForAction(action, scopedPeers, nowMs);
       if (conflicts.length === 0) {
         approvedActions.push(action);
         continue;
@@ -1050,6 +1244,21 @@ export class SessionManager {
         conflicts,
         peerMetadataBySessionId,
         policy: sessionArbitrationPolicy,
+        conflictFreshnessMsByKey: Object.fromEntries(
+          conflicts.map((conflict) => {
+            const matchingPeer = scopedPeers.find(
+              (peer) =>
+                peer.sessionId === conflict.otherSessionId &&
+                (normalizeResourceSet(peer.action.readSet).includes(conflict.resource) ||
+                  normalizeResourceSet(peer.action.writeSet).includes(conflict.resource))
+            );
+            const freshnessMs = Math.max(
+              0,
+              (matchingPeer?.lease.leaseUntil ?? nowMs) - nowMs
+            );
+            return [sessionConflictKey(conflict), freshnessMs];
+          })
+        ),
       });
       const arbitrationByConflict = new Map(
         arbitrations.map((arbitration) => [
@@ -1089,6 +1298,14 @@ export class SessionManager {
 
   stepSession(sessionId: string, request: StepSessionRequest): StepResult {
     const session = this.loadSession(sessionId);
+    const nowMs = request.nowMs ?? Date.now();
+    const pruned = pruneExpiredClaims(
+      session.heldResourceClaims,
+      session.heldResourceClaimLeases,
+      nowMs
+    );
+    session.heldResourceClaims = pruned.claims;
+    session.heldResourceClaimLeases = pruned.leases;
 
     const result = step({
       state: session.state,
@@ -1100,7 +1317,8 @@ export class SessionManager {
       residualLimits: request.residualLimits,
       fingerprintHistory: session.fingerprintHistory,
       priorRevocable: session.activeRevocable,
-      nowMs: request.nowMs,
+      priorOperationFingerprints: session.operationFingerprints,
+      nowMs,
     });
 
     if (
@@ -1118,7 +1336,8 @@ export class SessionManager {
       session.metadata,
       conflictContext,
       result.actionsApproved,
-      request.arbitrationPolicy
+      request.arbitrationPolicy,
+      nowMs
     );
     const approvedActionKeys = new Set(conflictGate.approvedActions.map(actionKey));
     const actionsApproved = conflictGate.approvedActions;
@@ -1147,10 +1366,15 @@ export class SessionManager {
       ...(request.context ? { context: deepClone(request.context) } : {}),
     };
 
-    const nextHeldResourceClaims = mergeHeldResourceClaims(
-      session.heldResourceClaims,
-      actionsApproved
-    );
+    const nextClaimState = mergeClaimState({
+      currentClaims: session.heldResourceClaims,
+      currentLeases: session.heldResourceClaimLeases,
+      approvedActions: actionsApproved,
+      nowMs,
+      leaseMs: this.claimLeaseMs,
+    });
+    const nextHeldResourceClaims = nextClaimState.claims;
+    const nextHeldResourceClaimLeases = nextClaimState.leases;
 
     try {
       this.store.appendSessionEvent(
@@ -1158,7 +1382,8 @@ export class SessionManager {
         session.stepCount,
         replay,
         session.metadata,
-        nextHeldResourceClaims
+        nextHeldResourceClaims,
+        nextHeldResourceClaimLeases
       );
     } catch (error: unknown) {
       if (isSessionStepConflictError(error)) {
@@ -1175,15 +1400,24 @@ export class SessionManager {
     session.stepCount += 1;
     session.fingerprintHistory = [...result.fingerprintHistory];
     session.heldResourceClaims = nextHeldResourceClaims;
+    session.heldResourceClaimLeases = nextHeldResourceClaimLeases;
     if (request.context) {
       session.lastEventContext = deepClone(request.context);
     }
+    session.lastReplayAttestation = replay.attestation
+      ? deepClone(replay.attestation)
+      : undefined;
     session.activeRevocable = reconcileRevocableActions(
       session.activeRevocable,
       actionsApproved,
       result.residualNext,
       result.stateNext
     );
+    for (const action of actionsApproved) {
+      const operationId = action.operationId?.trim();
+      if (!operationId) continue;
+      session.operationFingerprints[operationId] = actionOperationFingerprint(action);
+    }
 
     return {
       ...result,
@@ -1206,10 +1440,20 @@ export class SessionManager {
       request.releaseResourceClaims === true || metadata.status === "closed"
         ? []
         : deepClone(session.heldResourceClaims);
+    const heldResourceClaimLeases =
+      request.releaseResourceClaims === true || metadata.status === "closed"
+        ? {}
+        : deepClone(session.heldResourceClaimLeases);
 
-    this.store.updateSession(sessionId, metadata, heldResourceClaims);
+    this.store.updateSession(
+      sessionId,
+      metadata,
+      heldResourceClaims,
+      heldResourceClaimLeases
+    );
     session.metadata = deepClone(metadata);
     session.heldResourceClaims = deepClone(heldResourceClaims);
+    session.heldResourceClaimLeases = deepClone(heldResourceClaimLeases);
 
     return this.getState(sessionId);
   }
@@ -1226,6 +1470,17 @@ export class SessionManager {
       lastEventContext: session.lastEventContext
         ? deepClone(session.lastEventContext)
         : undefined,
+      lastReplayAttestation: session.lastReplayAttestation
+        ? deepClone(session.lastReplayAttestation)
+        : undefined,
+    };
+  }
+
+  getReplayEvents(sessionId: string): SessionReplaySnapshot {
+    this.loadSession(sessionId);
+    return {
+      sessionId,
+      events: deepClone(this.store.readSessionEvents(sessionId)),
     };
   }
 
@@ -1238,6 +1493,9 @@ export class SessionManager {
       heldResourceClaimCount: item.heldResourceClaimCount,
       lastEventContext: item.lastEventContext
         ? deepClone(item.lastEventContext)
+        : undefined,
+      lastReplayAttestation: item.lastReplayAttestation
+        ? deepClone(item.lastReplayAttestation)
         : undefined,
     }));
   }

@@ -21,15 +21,21 @@ export type { StepLogAdapter } from "./runtime/store";
 export { createFileLog } from "./runtime/fileAdapter";
 export { createResidualMcpServer, runStdioServer } from "./mcp/server";
 export { SessionManager } from "./mcp/sessions";
-export type { StepSessionRequest, SessionSnapshot, SessionListItem, LegacyImportResult } from "./mcp/sessions";
+export type {
+  StepSessionRequest,
+  SessionSnapshot,
+  SessionListItem,
+  LegacyImportResult,
+  SessionReplaySnapshot,
+} from "./mcp/sessions";
 
 // ── CCP₀ verification ────────────────────────────────────────────────────────
 export { translateTrace, verifyCcpTrace } from "./runtime/verify/ccp0";
 export type { CcpStore, CcpTrace, CcpOp, TellOp, AskOp } from "./runtime/verify/ccp0";
 
 // ── Observability ────────────────────────────────────────────────────────────
-export { diffStep, computeMetrics, summarizeTrace } from "./runtime/observe";
-export type { StepDiff, StepMetrics } from "./runtime/observe";
+export { diffStep, computeMetrics, summarizeTrace, buildAssuranceBundle } from "./runtime/observe";
+export type { StepDiff, StepMetrics, AssuranceBundle } from "./runtime/observe";
 
 // ── Factory functions ─────────────────────────────────────────────────────────
 export { createEmptyResidual, createInitialState, ageOf } from "./runtime/model";
@@ -47,6 +53,7 @@ export type {
   SessionMetadata,
   SessionMetadataInput,
   EventContext,
+  RiskTier,
   Action,
   Proposal,
   Input,
@@ -89,9 +96,12 @@ export type {
   DeadlockEvent,
   OscillationEvent,
   ResidualOverflowEvent,
+  ReplayAttestation,
   InvalidAdjudicationEvent,
   SoftBlockedAction,
   ActionCausalAnnotation,
+  RiskEscalationEvent,
+  IdempotencyEvent,
   SessionConflictType,
   SessionConflictScope,
   SessionConflictUnblock,

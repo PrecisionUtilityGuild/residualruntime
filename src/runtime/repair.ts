@@ -38,6 +38,18 @@ function cloneAdvice(advice: RepairAdvice): RepairAdvice {
   };
 }
 
+function cloneOwnership(ownership: BlockerCertificate["ownership"]): BlockerCertificate["ownership"] {
+  return {
+    ownerRole: ownership.ownerRole,
+    ownerRef: ownership.ownerRef,
+    sla: {
+      targetMs: ownership.sla.targetMs,
+      escalationTarget: ownership.sla.escalationTarget,
+      escalationMessage: ownership.sla.escalationMessage,
+    },
+  };
+}
+
 function cloneDirective(next: RepairDirective): RepairDirective {
   switch (next.kind) {
     case "replan_without_rejected_atom":
@@ -84,6 +96,7 @@ function actionKey(action: Action): string {
   return JSON.stringify({
     kind: action.kind,
     type: action.type,
+    operationId: action.operationId?.trim() || undefined,
     dependsOn: (action.dependsOn ?? []).slice().sort(),
     revocable: action.revocable === true,
     readSet: (action.readSet ?? []).slice().sort(),
@@ -118,6 +131,7 @@ function toRepairIntent(
     atoms: [...certificate.atoms],
     permanent: certificate.permanent,
     sufficient: certificate.sufficient,
+    ownership: cloneOwnership(certificate.ownership),
     advisory: cloneAdvice(certificate.recommendations),
     trace,
   };

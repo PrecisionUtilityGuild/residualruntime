@@ -30,6 +30,7 @@ type RepairIntentBase = {
   atoms: string[];
   permanent: boolean;
   sufficient: boolean;
+  ownership: BlockerCertificate["ownership"];
   advisory: RepairAdvice;
   trace: RepairTraceEntry;
 };

@@ -27,6 +27,15 @@ test("compileRepairPlan: maps all blocker families into a stable ordered repair 
       atoms: ["ship_fast"],
       permanent: false,
       sufficient: false,
+      ownership: {
+        ownerRole: "arbiter",
+        ownerRef: "arbiter:full_review|ship_fast",
+        sla: {
+          targetMs: 1800000,
+          escalationTarget: "human_review",
+          escalationMessage: "Escalate unresolved tension to human arbiter.",
+        },
+      },
       recommendations: {
         semantics: "advisory",
         moves: [{ kind: "query", target: "source-of-truth:full_review|ship_fast", reason: "Gather evidence." }],
@@ -47,6 +56,15 @@ test("compileRepairPlan: maps all blocker families into a stable ordered repair 
       atoms: ["forbidden_change"],
       permanent: true,
       sufficient: true,
+      ownership: {
+        ownerRole: "planner",
+        ownerRef: "planner:forbidden_change",
+        sla: {
+          targetMs: 3600000,
+          escalationTarget: "human_review",
+          escalationMessage: "Escalate permanent blocker to planner.",
+        },
+      },
       recommendations: {
         semantics: "advisory",
         moves: [{ kind: "query", target: "plan:alternatives:forbidden_change", reason: "Choose a safe alternative." }],
@@ -62,6 +80,15 @@ test("compileRepairPlan: maps all blocker families into a stable ordered repair 
       atoms: ["src/runtime/repair.ts"],
       permanent: false,
       sufficient: false,
+      ownership: {
+        ownerRole: "session_owner",
+        ownerRef: "session:session-2",
+        sla: {
+          targetMs: 900000,
+          escalationTarget: "session_coordination",
+          escalationMessage: "Escalate stalled session conflict coordination.",
+        },
+      },
       recommendations: {
         semantics: "advisory",
         moves: [{ kind: "observe", target: "resource:src/runtime/repair.ts", reason: "Wait for the other session to release the file." }],
@@ -82,6 +109,15 @@ test("compileRepairPlan: maps all blocker families into a stable ordered repair 
       atoms: ["lab_result"],
       permanent: false,
       sufficient: true,
+      ownership: {
+        ownerRole: "evidence_provider",
+        ownerRef: "evidence:lab_result",
+        sla: {
+          targetMs: 2700000,
+          escalationTarget: "incident_channel",
+          escalationMessage: "Escalate unresolved evidence gap to provider.",
+        },
+      },
       recommendations: {
         semantics: "advisory",
         moves: [{ kind: "run_check", target: "evidence:lab_result", reason: "Run the missing check." }],
@@ -98,6 +134,15 @@ test("compileRepairPlan: maps all blocker families into a stable ordered repair 
       atoms: ["attending_signoff"],
       permanent: false,
       sufficient: true,
+      ownership: {
+        ownerRole: "approver",
+        ownerRef: "approval:attending_signoff",
+        sla: {
+          targetMs: 7200000,
+          escalationTarget: "human_review",
+          escalationMessage: "Escalate deferred approval blocker.",
+        },
+      },
       recommendations: {
         semantics: "advisory",
         moves: [{ kind: "request_approval", target: "approval:attending_signoff", reason: "Request the missing approval." }],
@@ -142,6 +187,15 @@ test("compileRepairPlan: permanent rejected blockers compile to replan-only inte
       atoms: ["prod_db"],
       permanent: true,
       sufficient: true,
+      ownership: {
+        ownerRole: "planner",
+        ownerRef: "planner:prod_db",
+        sla: {
+          targetMs: 3600000,
+          escalationTarget: "human_review",
+          escalationMessage: "Escalate permanent rejected blocker.",
+        },
+      },
       recommendations: {
         semantics: "advisory",
         moves: [{ kind: "query", target: "plan:alternatives:prod_db", reason: "Select an alternate plan." }],
@@ -169,6 +223,15 @@ test("compileRepairPlan: keeps strict runtime directives separate from advisory 
       atoms: ["artifact"],
       permanent: false,
       sufficient: true,
+      ownership: {
+        ownerRole: "evidence_provider",
+        ownerRef: "evidence:artifact",
+        sla: {
+          targetMs: 2700000,
+          escalationTarget: "incident_channel",
+          escalationMessage: "Escalate unresolved artifact evidence gap.",
+        },
+      },
       recommendations: {
         semantics: "advisory",
         moves: [{ kind: "query", target: "evidence:artifact", reason: "Look for existing evidence." }],
@@ -201,6 +264,15 @@ test("compileRepairPlan: insufficient blockers remain multi-step repairs", () =>
       atoms: ["README.md"],
       permanent: false,
       sufficient: false,
+      ownership: {
+        ownerRole: "session_owner",
+        ownerRef: "session:session-9",
+        sla: {
+          targetMs: 900000,
+          escalationTarget: "session_coordination",
+          escalationMessage: "Escalate unresolved session coordination blocker.",
+        },
+      },
       recommendations: {
         semantics: "advisory",
         moves: [{ kind: "observe", target: "resource:README.md", reason: "Wait for the conflicting session." }],

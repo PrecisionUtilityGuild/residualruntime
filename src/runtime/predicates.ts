@@ -181,6 +181,69 @@ function deferredRecommendations(atom: string, constraintKinds: Set<string>): Ac
   return dedupeMoves(moves);
 }
 
+function blockerOwnership(args: {
+  blockerType: BlockerCertificate["blockerType"];
+  ownerRef: string;
+}): BlockerCertificate["ownership"] {
+  switch (args.blockerType) {
+    case "epistemic_rejected":
+      return {
+        ownerRole: "planner",
+        ownerRef: args.ownerRef,
+        sla: {
+          targetMs: 60 * 60 * 1000,
+          escalationTarget: "human_review",
+          escalationMessage:
+            "Permanent rejected atom requires explicit replan approval from planner/maintainer.",
+        },
+      };
+    case "epistemic_tension":
+      return {
+        ownerRole: "arbiter",
+        ownerRef: args.ownerRef,
+        sla: {
+          targetMs: 30 * 60 * 1000,
+          escalationTarget: "human_review",
+          escalationMessage:
+            "Open tension exceeded adjudication SLA; escalate to human arbiter.",
+        },
+      };
+    case "epistemic_evidence_gap":
+      return {
+        ownerRole: "evidence_provider",
+        ownerRef: args.ownerRef,
+        sla: {
+          targetMs: 45 * 60 * 1000,
+          escalationTarget: "incident_channel",
+          escalationMessage:
+            "Evidence gap unresolved within SLA; escalate to evidence-producing team.",
+        },
+      };
+    case "epistemic_deferred":
+      return {
+        ownerRole: "approver",
+        ownerRef: args.ownerRef,
+        sla: {
+          targetMs: 2 * 60 * 60 * 1000,
+          escalationTarget: "human_review",
+          escalationMessage:
+            "Deferred dependency remained unresolved past approval SLA; escalate approver chain.",
+        },
+      };
+    case "session_coordination":
+      return {
+        ownerRole: "session_owner",
+        ownerRef: args.ownerRef,
+        sla: {
+          targetMs: 15 * 60 * 1000,
+          escalationTarget: "session_coordination",
+          escalationMessage:
+            "Cross-session coordination conflict exceeded SLA; trigger explicit session coordination.",
+        },
+      };
+  }
+}
+
 export function whatWouldUnblock(
   action: Action,
   residual: Residual,
@@ -248,6 +311,10 @@ export function blockerCertificates(
         atoms: rejectedAtoms,
         permanent: true,
         sufficient: true,
+        ownership: blockerOwnership({
+          blockerType: "epistemic_rejected",
+          ownerRef: `planner:${rejectedAtoms.join("|")}`,
+        }),
         recommendations: {
           semantics: "advisory",
           moves: rejectedRecommendations(rejectedAtoms),
@@ -290,6 +357,10 @@ export function blockerCertificates(
       atoms: [tension.phi1, tension.phi2].filter((atom) => deps.includes(atom)),
       permanent: false,
       sufficient: options.some((option) => option.sufficient),
+      ownership: blockerOwnership({
+        blockerType: "epistemic_tension",
+        ownerRef: `arbiter:${[tension.phi1, tension.phi2].sort().join("|")}`,
+      }),
       recommendations: {
         semantics: "advisory",
         moves: tensionRecommendations(tension.phi1, tension.phi2),
@@ -323,6 +394,10 @@ export function blockerCertificates(
       atoms: [phi],
       permanent: false,
       sufficient: !blocks(after.residual, after.state, action),
+      ownership: blockerOwnership({
+        blockerType: "epistemic_evidence_gap",
+        ownerRef: `evidence:${phi}`,
+      }),
       recommendations: {
         semantics: "advisory",
         moves: evidenceGapRecommendations(phi),
@@ -365,6 +440,10 @@ export function blockerCertificates(
       atoms: [atom],
       permanent: false,
       sufficient: !blocks(after.residual, after.state, action),
+      ownership: blockerOwnership({
+        blockerType: "epistemic_deferred",
+        ownerRef: `approval:${atom}`,
+      }),
       recommendations: {
         semantics: "advisory",
         moves: deferredRecommendations(atom, deferredKindsByAtom.get(atom) ?? new Set<string>()),

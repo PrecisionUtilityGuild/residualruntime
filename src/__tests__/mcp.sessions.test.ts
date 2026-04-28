@@ -369,6 +369,119 @@ test("SessionManager holds resource claims across later steps until explicitly r
   }
 });
 
+test("SessionManager expires stale resource claims based on lease time", () => {
+  const dir = makeTmpDir();
+  const priorLeaseMs = process.env.RESIDUAL_SESSION_CLAIM_LEASE_MS;
+
+  try {
+    process.env.RESIDUAL_SESSION_CLAIM_LEASE_MS = "5";
+    const manager = new SessionManager(dir);
+    manager.newSession({ sessionId: "ticket-a" });
+    manager.newSession({ sessionId: "ticket-b" });
+
+    const first = manager.stepSession("ticket-a", {
+      context: { branch: "feature/shared", worktreeId: "wt-shared" },
+      proposals: [{ kind: "action", type: "WRITE_A", writeSet: ["resource:a"] }],
+      nowMs: 1000,
+    });
+    assert.equal(first.actionsApproved.length, 1);
+
+    const afterExpiry = manager.stepSession("ticket-b", {
+      context: { branch: "feature/shared", worktreeId: "wt-shared" },
+      proposals: [{ kind: "action", type: "WRITE_A_2", writeSet: ["resource:a"] }],
+      nowMs: 1010,
+    });
+    assert.equal(afterExpiry.actionsApproved.length, 1);
+    assert.equal(afterExpiry.actionsBlocked.length, 0);
+  } finally {
+    if (priorLeaseMs === undefined) delete process.env.RESIDUAL_SESSION_CLAIM_LEASE_MS;
+    else process.env.RESIDUAL_SESSION_CLAIM_LEASE_MS = priorLeaseMs;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager arbitration reason includes claim freshness context", () => {
+  const dir = makeTmpDir();
+  const priorLeaseMs = process.env.RESIDUAL_SESSION_CLAIM_LEASE_MS;
+
+  try {
+    process.env.RESIDUAL_SESSION_CLAIM_LEASE_MS = "60000";
+    const manager = new SessionManager(dir);
+    manager.newSession({ sessionId: "ticket-a" });
+    manager.newSession({ sessionId: "ticket-b" });
+
+    manager.stepSession("ticket-a", {
+      context: { branch: "feature/shared" },
+      proposals: [{ kind: "action", type: "WRITE_SHARED", writeSet: ["resource:shared"] }],
+      nowMs: 5000,
+    });
+
+    const second = manager.stepSession("ticket-b", {
+      context: { branch: "feature/shared" },
+      proposals: [{ kind: "action", type: "WRITE_SHARED_2", writeSet: ["resource:shared"] }],
+      nowMs: 5100,
+    });
+
+    assert.equal(second.sessionArbitrations.length, 1);
+    assert.match(second.sessionArbitrations[0].reason, /freshness=/);
+  } finally {
+    if (priorLeaseMs === undefined) delete process.env.RESIDUAL_SESSION_CLAIM_LEASE_MS;
+    else process.env.RESIDUAL_SESSION_CLAIM_LEASE_MS = priorLeaseMs;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager enforces operationId idempotency across steps", () => {
+  const dir = makeTmpDir();
+
+  try {
+    const manager = new SessionManager(dir);
+    manager.newSession({ sessionId: "ticket-a" });
+
+    const first = manager.stepSession("ticket-a", {
+      proposals: [
+        {
+          kind: "action",
+          type: "DEPLOY",
+          operationId: "op-77",
+        },
+      ],
+    });
+    assert.equal(first.actionsApproved.length, 1);
+
+    const duplicate = manager.stepSession("ticket-a", {
+      proposals: [
+        {
+          kind: "action",
+          type: "DEPLOY",
+          operationId: "op-77",
+        },
+      ],
+    });
+    assert.equal(duplicate.actionsApproved.length, 0);
+    assert.equal(duplicate.actionsBlocked.length, 0);
+    assert.equal(duplicate.idempotencyEvents.length, 1);
+    assert.equal(duplicate.idempotencyEvents[0].outcome, "duplicate_approved_ignored");
+
+    const conflict = manager.stepSession("ticket-a", {
+      proposals: [
+        {
+          kind: "action",
+          type: "DEPLOY",
+          operationId: "op-77",
+          revocable: true,
+        },
+      ],
+    });
+    assert.equal(conflict.actionsApproved.length, 0);
+    assert.equal(conflict.actionsBlocked.length, 1);
+    assert.equal(conflict.idempotencyEvents.length, 1);
+    assert.equal(conflict.idempotencyEvents[0].outcome, "operation_conflict_blocked");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("SessionManager requires fresh context for resource claims", () => {
   const dir = makeTmpDir();
 

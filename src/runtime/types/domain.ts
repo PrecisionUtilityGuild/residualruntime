@@ -68,10 +68,15 @@ export type EventContext = {
   actorId?: string;
 };
 
+export type RiskTier = "low" | "medium" | "high" | "critical";
+
 export type Action = {
   kind: "action";
   type: string;
+  // Optional caller-supplied idempotency key for exactly-once operation intent.
+  operationId?: string;
   dependsOn?: string[];
+  riskTier?: RiskTier;
   revocable?: boolean;
   // Optional resource declarations for cross-session conflict detection.
   readSet?: string[];
@@ -144,6 +149,20 @@ export type BlockerCertificate = {
   atoms: string[];
   permanent: boolean;
   sufficient: boolean;
+  ownership: {
+    ownerRole:
+      | "planner"
+      | "arbiter"
+      | "evidence_provider"
+      | "approver"
+      | "session_owner";
+    ownerRef: string;
+    sla: {
+      targetMs: number;
+      escalationTarget: "human_review" | "incident_channel" | "session_coordination";
+      escalationMessage: string;
+    };
+  };
   recommendations: {
     semantics: "advisory";
     moves: AcquisitionMove[];

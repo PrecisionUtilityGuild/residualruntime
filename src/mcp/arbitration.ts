@@ -20,6 +20,7 @@ type ArbitrationParams = {
   conflicts: SessionConflictEvent[];
   peerMetadataBySessionId: Record<string, SessionMetadata>;
   policy: SessionArbitrationPolicy;
+  conflictFreshnessMsByKey?: Record<string, number>;
 };
 
 const DEFAULT_OBJECTIVE_TYPE_PRIORITY: Record<string, number> = {
@@ -246,6 +247,12 @@ export function arbitrateSessionConflicts(
         mode === "branch_split_required"
           ? "policy requires branch split for this conflict class"
           : "policy requires serialized execution for this conflict class";
+      const conflictKey = `${conflict.conflictType}|${conflict.resource}|${conflict.otherSessionId}`;
+      const freshnessMs = params.conflictFreshnessMsByKey?.[conflictKey];
+      const freshnessReason =
+        freshnessMs !== undefined
+          ? `peer claim freshness=${Math.max(0, freshnessMs)}ms remaining`
+          : undefined;
 
       const unblock =
         mode === "branch_split_required"
@@ -296,7 +303,7 @@ export function arbitrateSessionConflicts(
           otherSessionPriority: preference.otherSessionPriority,
           tieBreak: preference.tieBreak,
         },
-        reason: `${modeReason}; ${priorityReason} via ${preference.tieBreak} precedence.`,
+        reason: `${modeReason}; ${priorityReason} via ${preference.tieBreak} precedence.${freshnessReason ? ` ${freshnessReason}.` : ""}`,
         unblock,
       };
     }

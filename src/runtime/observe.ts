@@ -1,5 +1,7 @@
 import type { Action, Assumption, EvidenceGap, ReplayEvent, Tension } from "./model";
 import { translateTrace, verifyCcpTrace } from "./verify/ccp0";
+import { createHash } from "node:crypto";
+import { blockerCertificates } from "./predicates";
 
 export type StepDiff = {
   tensionsAdded: Tension[];
@@ -21,6 +23,33 @@ export type StepMetrics = {
   blockedRate: number;
   avgResidualSize: number;
   peakResidualSize: number;
+};
+
+export type AssuranceBundle = {
+  bundleVersion: "assurance.v1";
+  generatedAt: number;
+  traceSummary: string;
+  metrics: StepMetrics;
+  decision: {
+    combinedDecisionHash: string;
+    decisionHashes: string[];
+  };
+  attestation: {
+    totalSteps: number;
+    withAttestation: number;
+    runtimeVersions: string[];
+    schemaVersions: string[];
+    policyVersions: string[];
+  };
+  blockers: {
+    blockedActions: number;
+    certificateCountsByType: Record<string, number>;
+    ownershipCountsByRole: Record<string, number>;
+  };
+  ccp: {
+    valid: boolean;
+    violations: string[];
+  };
 };
 
 function tensionKey(t: Tension): string {
@@ -142,4 +171,72 @@ export function summarizeTrace(events: ReplayEvent[]): string {
   }
 
   return lines.join("\n");
+}
+
+export function buildAssuranceBundle(events: ReplayEvent[]): AssuranceBundle {
+  const metrics = computeMetrics(events);
+  const traceSummary = summarizeTrace(events);
+  const decisionHashes = events
+    .map((event) => event.decisionHash)
+    .filter((value): value is string => typeof value === "string" && value.length > 0);
+  const combinedDecisionHash = createHash("sha256")
+    .update(decisionHashes.join("\n"))
+    .digest("hex");
+
+  const runtimeVersions = new Set<string>();
+  const schemaVersions = new Set<string>();
+  const policyVersions = new Set<string>();
+  let withAttestation = 0;
+  for (const event of events) {
+    const attestation = event.attestation;
+    if (!attestation) continue;
+    withAttestation += 1;
+    runtimeVersions.add(attestation.runtimeVersion);
+    schemaVersions.add(attestation.schemaVersion);
+    policyVersions.add(attestation.policyVersion);
+  }
+
+  const certificateCountsByType: Record<string, number> = {};
+  const ownershipCountsByRole: Record<string, number> = {};
+  let blockedActions = 0;
+  for (const event of events) {
+    for (const action of event.blockedActions) {
+      blockedActions += 1;
+      const certificates = blockerCertificates(action, event.after.residual, event.after.state);
+      for (const certificate of certificates) {
+        certificateCountsByType[certificate.blockerType] =
+          (certificateCountsByType[certificate.blockerType] ?? 0) + 1;
+        ownershipCountsByRole[certificate.ownership.ownerRole] =
+          (ownershipCountsByRole[certificate.ownership.ownerRole] ?? 0) + 1;
+      }
+    }
+  }
+
+  const ccpCheck = verifyCcpTrace(translateTrace(events));
+  return {
+    bundleVersion: "assurance.v1",
+    generatedAt: Date.now(),
+    traceSummary,
+    metrics,
+    decision: {
+      combinedDecisionHash,
+      decisionHashes,
+    },
+    attestation: {
+      totalSteps: events.length,
+      withAttestation,
+      runtimeVersions: [...runtimeVersions].sort(),
+      schemaVersions: [...schemaVersions].sort(),
+      policyVersions: [...policyVersions].sort(),
+    },
+    blockers: {
+      blockedActions,
+      certificateCountsByType,
+      ownershipCountsByRole,
+    },
+    ccp: {
+      valid: ccpCheck.valid,
+      violations: [...ccpCheck.violations],
+    },
+  };
 }

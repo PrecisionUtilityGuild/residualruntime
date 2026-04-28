@@ -5,6 +5,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { compileRepairPlan } from "../runtime/repair";
 import { blockerCertificates } from "../runtime/predicates";
+import { buildAssuranceBundle } from "../runtime/observe";
 import type {
   Action,
   AcquisitionMove,
@@ -75,7 +76,9 @@ const proposalSchema = z.discriminatedUnion("kind", [
     .object({
       kind: z.literal("action"),
       type: nonEmptyStringSchema,
+      operationId: nonEmptyStringSchema.optional(),
       dependsOn: z.array(nonEmptyStringSchema).optional(),
+      riskTier: z.enum(["low", "medium", "high", "critical"]).optional(),
       revocable: z.boolean().optional(),
       readSet: z.array(nonEmptyStringSchema).optional(),
       writeSet: z.array(nonEmptyStringSchema).optional(),
@@ -124,7 +127,9 @@ const actionSchema = z
   .object({
     kind: z.literal("action"),
     type: nonEmptyStringSchema,
+    operationId: nonEmptyStringSchema.optional(),
     dependsOn: z.array(nonEmptyStringSchema).optional(),
+    riskTier: z.enum(["low", "medium", "high", "critical"]).optional(),
     revocable: z.boolean().optional(),
     readSet: z.array(nonEmptyStringSchema).optional(),
     writeSet: z.array(nonEmptyStringSchema).optional(),
@@ -234,6 +239,29 @@ const blockerCertificateSchema = z
     atoms: z.array(nonEmptyStringSchema),
     permanent: z.boolean(),
     sufficient: z.boolean(),
+    ownership: z
+      .object({
+        ownerRole: z.enum([
+          "planner",
+          "arbiter",
+          "evidence_provider",
+          "approver",
+          "session_owner",
+        ]),
+        ownerRef: nonEmptyStringSchema,
+        sla: z
+          .object({
+            targetMs: z.number().int().positive(),
+            escalationTarget: z.enum([
+              "human_review",
+              "incident_channel",
+              "session_coordination",
+            ]),
+            escalationMessage: nonEmptyStringSchema,
+          })
+          .strict(),
+      })
+      .strict(),
     recommendations: z
       .object({
         semantics: z.literal("advisory"),
@@ -436,10 +464,18 @@ const suggestRepairsArgsSchema = z
   })
   .strict();
 
+const exportAssuranceBundleArgsSchema = z
+  .object({
+    sessionId: nonEmptyStringSchema,
+    includeReplayEvents: z.boolean().optional(),
+  })
+  .strict();
+
 type StepArgs = z.infer<typeof stepArgsSchema>;
 type NewSessionArgs = z.infer<typeof newSessionArgsSchema>;
 type UpdateSessionArgs = z.infer<typeof updateSessionArgsSchema>;
 type SuggestRepairsArgs = z.infer<typeof suggestRepairsArgsSchema>;
+type ExportAssuranceBundleArgs = z.infer<typeof exportAssuranceBundleArgsSchema>;
 
 function toToolResponse(payload: Record<string, unknown>) {
   return {
@@ -517,6 +553,8 @@ function summarizeResidualVerbose(residual: Residual) {
 function actionKey(action: Action): string {
   return JSON.stringify({
     type: action.type,
+    operationId: action.operationId?.trim() || undefined,
+    riskTier: action.riskTier ?? "medium",
     dependsOn: (action.dependsOn ?? []).slice().sort(),
     readSet: (action.readSet ?? []).slice().sort(),
     writeSet: (action.writeSet ?? []).slice().sort(),
@@ -596,6 +634,16 @@ function buildSessionCertificates(
       atoms: [conflict.resource],
       permanent: false,
       sufficient: false,
+      ownership: {
+        ownerRole: "session_owner",
+        ownerRef: `session:${conflict.otherSessionId}`,
+        sla: {
+          targetMs: 15 * 60 * 1000,
+          escalationTarget: "session_coordination",
+          escalationMessage:
+            "Session coordination conflict unresolved within SLA; escalate to coordination owner.",
+        },
+      },
       recommendations: {
         semantics: "advisory",
         moves: sessionCoordinationRecommendations({ conflict, arbitration }),
@@ -679,6 +727,8 @@ export function createResidualMcpServer(options?: { sessionRootDir?: string }) {
         metadata: snapshot.metadata,
         heldResourceClaims: snapshot.heldResourceClaims,
         lastEventContext: snapshot.lastEventContext,
+        lastReplayAttestation: snapshot.lastReplayAttestation,
+        replayAttestation: result.attestation,
         actionsApproved: result.actionsApproved,
         ...blockedSummary,
         residualSummary: summarizeResidualCounts(result.residualNext),
@@ -689,6 +739,8 @@ export function createResidualMcpServer(options?: { sessionRootDir?: string }) {
           oscillations: result.oscillations,
           invalidAdjudications: result.invalidAdjudications,
           autoAdjudications: result.autoAdjudications,
+          riskEscalations: result.riskEscalations,
+          idempotencyEvents: result.idempotencyEvents,
           revokedActions: result.revokedActions,
           reopenApplied: result.reopenApplied,
           reopenBlocked: result.reopenBlocked,
@@ -723,6 +775,25 @@ export function createResidualMcpServer(options?: { sessionRootDir?: string }) {
   );
 
   server.registerTool(
+    "export_assurance_bundle",
+    {
+      description:
+        "Export a deterministic assurance bundle for a session, including metrics, decision hashes, attestation coverage, blocker ownership counts, and CCP verification.",
+      inputSchema: exportAssuranceBundleArgsSchema,
+    },
+    async (args: ExportAssuranceBundleArgs) => {
+      const replay = sessionManager.getReplayEvents(args.sessionId);
+      const bundle = buildAssuranceBundle(replay.events);
+      return toToolResponse({
+        sessionId: args.sessionId,
+        stepCount: replay.events.length,
+        bundle,
+        ...(args.includeReplayEvents ? { replayEvents: replay.events } : {}),
+      });
+    }
+  );
+
+  server.registerTool(
     "get_state",
     {
       description: "Return current state and residual for a session.",
@@ -736,6 +807,7 @@ export function createResidualMcpServer(options?: { sessionRootDir?: string }) {
         metadata: snapshot.metadata,
         heldResourceClaims: snapshot.heldResourceClaims,
         lastEventContext: snapshot.lastEventContext,
+        lastReplayAttestation: snapshot.lastReplayAttestation,
         state: snapshot.state,
         residual: snapshot.residual,
         residualSummary: summarizeResidualVerbose(snapshot.residual),
@@ -773,6 +845,7 @@ export function createResidualMcpServer(options?: { sessionRootDir?: string }) {
         metadata: snapshot.metadata,
         heldResourceClaims: snapshot.heldResourceClaims,
         lastEventContext: snapshot.lastEventContext,
+        lastReplayAttestation: snapshot.lastReplayAttestation,
         sessionPath: sessionManager.getLogPath(snapshot.sessionId),
         state: snapshot.state,
         residual: snapshot.residual,
@@ -800,6 +873,7 @@ export function createResidualMcpServer(options?: { sessionRootDir?: string }) {
         metadata: snapshot.metadata,
         heldResourceClaims: snapshot.heldResourceClaims,
         lastEventContext: snapshot.lastEventContext,
+        lastReplayAttestation: snapshot.lastReplayAttestation,
         state: snapshot.state,
         residual: snapshot.residual,
       });

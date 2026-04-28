@@ -1,4 +1,4 @@
-import type { Action, Constraint, EventContext, Residual, State } from "./domain";
+import type { Action, Constraint, EventContext, Residual, RiskTier, State } from "./domain";
 
 export type EscalationEvent = {
   kind: "escalation";
@@ -67,6 +67,22 @@ export type ActionCausalAnnotation = {
   enabledBy: string[];
 };
 
+export type RiskEscalationEvent = {
+  kind: "risk_escalation";
+  action: Action;
+  tier: RiskTier;
+  reason: "blocked_high_risk_action";
+  requiredHumanReview: true;
+};
+
+export type IdempotencyEvent = {
+  kind: "idempotency";
+  operationId: string;
+  action: Action;
+  outcome: "duplicate_approved_ignored" | "operation_conflict_blocked";
+  reason: string;
+};
+
 export type SessionConflictType = "write_write" | "read_write";
 
 export type SessionConflictScope = {
@@ -132,7 +148,16 @@ export type SessionArbitrationEvent = {
   unblock: SessionConflictUnblock[];
 };
 
+export type ReplayAttestation = {
+  runtimeVersion: string;
+  schemaVersion: string;
+  policyVersion: string;
+  adapterVersion?: string;
+};
+
 export type ReplayEvent = {
+  decisionHash?: string;
+  attestation?: ReplayAttestation;
   context?: EventContext;
   input: { evidence?: Record<string, number>; constraints?: Constraint[]; adjudications?: Array<{ phi1: string; phi2: string; winner: string }> };
   before: { state: State; residual: Residual };
@@ -149,10 +174,14 @@ export type ReplayEvent = {
     conflicts: SessionConflictEvent[];
     arbitrations: SessionArbitrationEvent[];
   };
+  riskEscalations?: RiskEscalationEvent[];
+  idempotencyEvents?: IdempotencyEvent[];
   after: { state: State; residual: Residual };
 };
 
 export type StepResult = {
+  decisionHash: string;
+  attestation: ReplayAttestation;
   stateNext: State;
   residualNext: Residual;
   actionsApproved: Action[];
@@ -172,6 +201,8 @@ export type StepResult = {
   sessionArbitrationPolicy: SessionArbitrationPolicy;
   sessionConflicts: SessionConflictEvent[];
   sessionArbitrations: SessionArbitrationEvent[];
+  riskEscalations: RiskEscalationEvent[];
+  idempotencyEvents: IdempotencyEvent[];
   emittedRevocable: Action[];
   revokedActions: Action[];
   replay: ReplayEvent;

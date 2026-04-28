@@ -55,6 +55,7 @@ test("MCP server exposes expected tools and supports basic step flow", async () 
     const listedTools = await client.listTools();
     const names = listedTools.tools.map((tool) => tool.name).sort();
     assert.deepEqual(names, [
+      "export_assurance_bundle",
       "get_state",
       "list_sessions",
       "new_session",
@@ -101,12 +102,22 @@ test("MCP server exposes expected tools and supports basic step flow", async () 
       stepCount: number;
       metadata: { objectiveRef?: string };
       lastEventContext?: { branch?: string; actorId?: string };
+      replayAttestation?: {
+        runtimeVersion: string;
+        schemaVersion: string;
+        policyVersion: string;
+      };
       actionsApproved: Array<{ type: string }>;
       blocked: Array<{
         action: { type: string };
         certificates: Array<{
           blockerType: string;
           atoms: string[];
+          ownership: {
+            ownerRole: string;
+            ownerRef: string;
+            sla: { targetMs: number; escalationTarget: string };
+          };
           recommendations: { semantics: string; moves: Array<{ kind: string; target: string }> };
           next: { kind: string };
         }>;
@@ -126,6 +137,8 @@ test("MCP server exposes expected tools and supports basic step flow", async () 
       blockedStep.blocked[0].certificates.some(
         (certificate) =>
           certificate.blockerType === "epistemic_tension" &&
+          certificate.ownership.ownerRole === "arbiter" &&
+          certificate.ownership.sla.targetMs > 0 &&
           certificate.recommendations.semantics === "advisory" &&
           certificate.recommendations.moves.some((move) => move.kind === "query") &&
           certificate.next.kind === "adjudicate_tension"
@@ -138,6 +151,7 @@ test("MCP server exposes expected tools and supports basic step flow", async () 
     assert.equal(blockedStep.metadata.objectiveRef, "ABC-42");
     assert.equal(blockedStep.lastEventContext?.branch, "feature/abc-42");
     assert.equal(blockedStep.lastEventContext?.actorId, "agent-1");
+    assert.equal(blockedStep.replayAttestation?.schemaVersion, "replay.v2");
 
     const approvedStepResult = await client.callTool({
       name: "step",
@@ -167,6 +181,11 @@ test("MCP server exposes expected tools and supports basic step flow", async () 
       stepCount: number;
       metadata: { objectiveRef?: string };
       lastEventContext?: { branch?: string; actorId?: string };
+      lastReplayAttestation?: {
+        runtimeVersion: string;
+        schemaVersion: string;
+        policyVersion: string;
+      };
       residualSummary: {
         counts: { tensions: number };
         tensions: unknown[];
@@ -175,6 +194,7 @@ test("MCP server exposes expected tools and supports basic step flow", async () 
     assert.equal(state.stepCount, 2);
     assert.equal(state.metadata.objectiveRef, "ABC-42");
     assert.equal(state.lastEventContext?.branch, "feature/abc-42");
+    assert.equal(state.lastReplayAttestation?.runtimeVersion, "0.1.0");
     assert.equal(state.residualSummary.counts.tensions, 0);
     assert.ok(Array.isArray(state.residualSummary.tensions));
 
@@ -192,6 +212,58 @@ test("MCP server exposes expected tools and supports basic step flow", async () 
     assert.equal(listedSessions.sessions[0].stepCount, 2);
     assert.equal(listedSessions.sessions[0].metadata.objectiveRef, "ABC-42");
     assert.equal(listedSessions.sessions[0].metadata.status, "active");
+  } finally {
+    await client.close();
+    await server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("MCP export_assurance_bundle returns deterministic assurance artifact", async () => {
+  const dir = makeTmpDir();
+  const { server } = createResidualMcpServer({ sessionRootDir: dir });
+  const client = new Client({ name: "residual-runtime-test-client", version: "0.1.0" });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+  try {
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    await client.callTool({ name: "new_session", arguments: { sessionId: "bundle-room" } });
+    await client.callTool({
+      name: "step",
+      arguments: {
+        sessionId: "bundle-room",
+        input: { constraints: [{ type: "Unresolved", phi1: "x=true", phi2: "x=false" }] },
+        proposals: [{ kind: "action", type: "USE_X_TRUE", dependsOn: ["x=true"] }],
+      },
+    });
+
+    const exported = readStructuredContent<{
+      sessionId: string;
+      stepCount: number;
+      bundle: {
+        bundleVersion: string;
+        metrics: { totalSteps: number };
+        decision: { combinedDecisionHash: string; decisionHashes: string[] };
+        attestation: { withAttestation: number };
+        ccp: { valid: boolean };
+      };
+      replayEvents?: unknown[];
+    }>(
+      await client.callTool({
+        name: "export_assurance_bundle",
+        arguments: { sessionId: "bundle-room", includeReplayEvents: true },
+      })
+    );
+
+    assert.equal(exported.sessionId, "bundle-room");
+    assert.equal(exported.stepCount, 1);
+    assert.equal(exported.bundle.bundleVersion, "assurance.v1");
+    assert.equal(exported.bundle.metrics.totalSteps, 1);
+    assert.equal(exported.bundle.attestation.withAttestation, 1);
+    assert.equal(exported.bundle.decision.decisionHashes.length, 1);
+    assert.ok(exported.bundle.decision.combinedDecisionHash.length > 0);
+    assert.equal(exported.bundle.ccp.valid, true);
+    assert.equal(Array.isArray(exported.replayEvents), true);
   } finally {
     await client.close();
     await server.close();
@@ -418,6 +490,7 @@ test("MCP step surfaces cross-session conflicts with unblock guidance", async ()
       }>;
       events: {
         sessionArbitrationPolicy: { enabled: boolean; defaultMode: string };
+        riskEscalations: Array<{ tier: string; reason: string; requiredHumanReview: boolean }>;
         sessionConflicts: Array<{
           conflictType: string;
           resource: string;
@@ -456,6 +529,7 @@ test("MCP step surfaces cross-session conflicts with unblock guidance", async ()
     assert.equal(conflictingStep.events.sessionArbitrationPolicy.enabled, true);
     assert.equal(conflictingStep.events.sessionArbitrationPolicy.defaultMode, "serialize_first");
     assert.equal(conflictingStep.events.sessionArbitrations.length, 1);
+    assert.equal(conflictingStep.events.riskEscalations.length, 0);
     assert.equal(conflictingStep.events.sessionArbitrations[0].mode, "serialize_first");
     assert.equal(conflictingStep.events.sessionArbitrations[0].outcome, "serialize_wait");
     assert.equal(conflictingStep.events.sessionConflicts[0].conflictType, "read_write");
@@ -494,6 +568,127 @@ test("MCP step surfaces cross-session conflicts with unblock guidance", async ()
     assert.equal(coordinationIntent?.strict.mode, "serialize_first");
     assert.equal(coordinationIntent?.strict.outcome, "serialize_wait");
     assert.ok((coordinationIntent?.strict.unblock?.length ?? 0) >= 1);
+  } finally {
+    await client.close();
+    await server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("MCP step emits risk escalation events for blocked high-risk actions", async () => {
+  const dir = makeTmpDir();
+  const { server } = createResidualMcpServer({ sessionRootDir: dir });
+  const client = new Client({ name: "residual-runtime-test-client", version: "0.1.0" });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+  try {
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    await client.callTool({ name: "new_session", arguments: { sessionId: "risk-room" } });
+
+    const result = readStructuredContent<{
+      actionsApproved: Array<{ type: string }>;
+      blocked: Array<{ action: { type: string } }>;
+      events: {
+        riskEscalations: Array<{
+          tier: string;
+          reason: string;
+          requiredHumanReview: boolean;
+          action: { type: string };
+        }>;
+      };
+    }>(
+      await client.callTool({
+        name: "step",
+        arguments: {
+          sessionId: "risk-room",
+          input: {
+            constraints: [{ type: "RequireEvidence", phi: "security_scan_ok", threshold: 0.95 }],
+            evidence: { security_scan_ok: 0.4 },
+          },
+          proposals: [
+            {
+              kind: "action",
+              type: "DEPLOY_TO_PRODUCTION",
+              riskTier: "critical",
+              dependsOn: ["security_scan_ok"],
+            },
+          ],
+        },
+      })
+    );
+
+    assert.equal(result.actionsApproved.length, 0);
+    assert.equal(result.blocked.length, 1);
+    assert.equal(result.events.riskEscalations.length, 1);
+    assert.equal(result.events.riskEscalations[0].tier, "critical");
+    assert.equal(result.events.riskEscalations[0].reason, "blocked_high_risk_action");
+    assert.equal(result.events.riskEscalations[0].requiredHumanReview, true);
+    assert.equal(result.events.riskEscalations[0].action.type, "DEPLOY_TO_PRODUCTION");
+  } finally {
+    await client.close();
+    await server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("MCP step enforces operationId idempotency contract", async () => {
+  const dir = makeTmpDir();
+  const { server } = createResidualMcpServer({ sessionRootDir: dir });
+  const client = new Client({ name: "residual-runtime-test-client", version: "0.1.0" });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+  try {
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    await client.callTool({ name: "new_session", arguments: { sessionId: "idempotency-room" } });
+
+    const first = readStructuredContent<{ actionsApproved: Array<{ type: string }> }>(
+      await client.callTool({
+        name: "step",
+        arguments: {
+          sessionId: "idempotency-room",
+          proposals: [{ kind: "action", type: "DEPLOY", operationId: "op-9" }],
+        },
+      })
+    );
+    assert.equal(first.actionsApproved.length, 1);
+
+    const duplicate = readStructuredContent<{
+      actionsApproved: Array<{ type: string }>;
+      blocked: Array<{ action: { type: string } }>;
+      events: { idempotencyEvents: Array<{ operationId: string; outcome: string }> };
+    }>(
+      await client.callTool({
+        name: "step",
+        arguments: {
+          sessionId: "idempotency-room",
+          proposals: [{ kind: "action", type: "DEPLOY", operationId: "op-9" }],
+        },
+      })
+    );
+    assert.equal(duplicate.actionsApproved.length, 0);
+    assert.equal(duplicate.blocked.length, 0);
+    assert.equal(duplicate.events.idempotencyEvents.length, 1);
+    assert.equal(duplicate.events.idempotencyEvents[0].operationId, "op-9");
+    assert.equal(duplicate.events.idempotencyEvents[0].outcome, "duplicate_approved_ignored");
+
+    const conflict = readStructuredContent<{
+      actionsApproved: Array<{ type: string }>;
+      blocked: Array<{ action: { type: string } }>;
+      events: { idempotencyEvents: Array<{ operationId: string; outcome: string }> };
+    }>(
+      await client.callTool({
+        name: "step",
+        arguments: {
+          sessionId: "idempotency-room",
+          proposals: [{ kind: "action", type: "DEPLOY", operationId: "op-9", revocable: true }],
+        },
+      })
+    );
+    assert.equal(conflict.actionsApproved.length, 0);
+    assert.equal(conflict.blocked.length, 1);
+    assert.equal(conflict.events.idempotencyEvents.length, 1);
+    assert.equal(conflict.events.idempotencyEvents[0].operationId, "op-9");
+    assert.equal(conflict.events.idempotencyEvents[0].outcome, "operation_conflict_blocked");
   } finally {
     await client.close();
     await server.close();

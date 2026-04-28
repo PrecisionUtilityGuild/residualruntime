@@ -10,6 +10,7 @@ export type {
   SessionMetadata,
   SessionMetadataInput,
   EventContext,
+  RiskTier,
   Action,
   Proposal,
   ReopenSignal,
@@ -51,6 +52,7 @@ export type {
 } from "./types/repair";
 
 export type {
+  ReplayAttestation,
   EscalationEvent,
   DeadlockEvent,
   OscillationEvent,
@@ -60,6 +62,8 @@ export type {
   ReopenBlockedEvent,
   SoftBlockedAction,
   ActionCausalAnnotation,
+  RiskEscalationEvent,
+  IdempotencyEvent,
   SessionConflictType,
   SessionConflictScope,
   SessionConflictUnblock,
