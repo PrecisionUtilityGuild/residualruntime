@@ -1,0 +1,67 @@
+{
+  "name": "residual-runtime",
+  "version": "0.1.0",
+  "description": "Runtime enforcement layer for AI and programmatic workflows — blocks actions while semantic work is unresolved",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "residual-mcp": "dist/mcp/server.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/index.js",
+    "dist/index.d.ts",
+    "dist/mcp",
+    "dist/runtime"
+  ],
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build": "npm run clean && tsc",
+    "build:release": "npm run clean && tsc -p tsconfig.package.json && node scripts/build-release.js",
+    "start": "npm run build && node dist/index.js",
+    "test": "npm run build && NODE_ENV=test node --test \"dist/**/*.test.js\"",
+    "example:failure-case": "npm run build && node dist/examples/concreteFailureCase.js",
+    "example:repair-runbook": "npm run build && node dist/examples/repairRunbook.js",
+    "cli": "npm run build && node dist/cli/index.js",
+    "mcp": "npm run build && node dist/mcp/server.js",
+    "mcp:migrate": "npm run build && node dist/mcp/migrate.js",
+    "mcp:dev": "tsx src/mcp/server.ts",
+    "mcp:migrate:dev": "tsx src/mcp/migrate.ts",
+    "package:check": "npm run build:release && node scripts/check-package.js",
+    "typecheck": "tsc --noEmit",
+    "ci": "npm run typecheck && npm test",
+    "prepublishOnly": "npm run ci && npm run package:check"
+  },
+  "keywords": [
+    "residual",
+    "runtime",
+    "ai",
+    "agent",
+    "constraint",
+    "blocking"
+  ],
+  "author": "",
+  "license": "ISC",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^25.6.0",
+    "esbuild": "^0.28.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "better-sqlite3": "^12.9.0",
+    "ollama": "^0.6.3",
+    "zod": "^4.3.6"
+  }
+}

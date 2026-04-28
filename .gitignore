@@ -1,0 +1,14 @@
+.cache/
+dist/
+.claude/
+node_modules/
+CLAUDE.md
+Claude.MD
+.DS_Store
+.env
+.env.local
+.env.example
+.env.test
+*.ndjson
+*.cjs
+.residual-sessions/

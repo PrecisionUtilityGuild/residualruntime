@@ -1,0 +1,19 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "outDir": "dist"
+  },
+  "include": [
+    "src/index.ts",
+    "src/mcp/**/*.ts",
+    "src/runtime/**/*.ts"
+  ],
+  "exclude": [
+    "src/__tests__/**",
+    "src/cli/**",
+    "src/examples/**",
+    "src/research/**"
+  ]
+}
